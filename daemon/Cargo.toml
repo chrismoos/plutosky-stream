@@ -1,0 +1,38 @@
+[package]
+name = "plutosky-streamd"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "On-board daemon for plutosky-stream: drives the AD9363, the VITA packetizers and the GEM slot fast path, and serves the gRPC control service."
+
+[features]
+default = ["hardware"]
+# Compiles the AD9361 no-OS driver, which needs a C toolchain for the target.
+# Off leaves a binary that only runs with --fake.
+hardware = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+parking_lot = "0.12"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport"] }
+tonic-prost = "0.14"
+
+[dev-dependencies]
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "transport"] }
+
+[build-dependencies]
+cc = "1"
+protox = "0.10"
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
+
+[lints.clippy]
+uninlined_format_args = "warn"

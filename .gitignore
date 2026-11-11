@@ -1,0 +1,10 @@
+gateware/.venv/
+gateware/build/
+gateware/__pycache__/
+**/__pycache__/
+*.pyc
+gateware/.pytest_cache/
+.pytest_cache/
+.DS_Store
+build/
+gateware/build_artifacts/**/vivado.log

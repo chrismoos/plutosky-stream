@@ -1,0 +1,8 @@
+# Gateware toolchain for the plutosky-stream SoC. Create the venv with
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# LiteX and Migen are pinned to git commits because the PyPI releases lag.
+amaranth==0.5.8
+numpy==2.4.6
+pytest==9.1.1
+migen @ git+https://github.com/m-labs/migen.git@e19524c963a8342952840983047557707fbe0b6a
+litex @ git+https://github.com/enjoy-digital/litex.git@d2102adce464c8e2168c3212315ce0a28df678c1

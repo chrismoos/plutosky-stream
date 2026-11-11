@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A runner may be a container without sudo, Rust or build tools, so each job
+# installs what it needs.
+
+jobs:
+  daemon:
+    name: Daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update
+          $SUDO apt-get install -y build-essential curl
+      - name: Install Rust
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Format
+        working-directory: daemon
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        working-directory: daemon
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Test
+        working-directory: daemon
+        run: cargo test --release
+
+  soapy:
+    name: SoapySDR module and tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update
+          $SUDO apt-get install -y build-essential cmake libsoapysdr-dev python3-soapysdr \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+            python3-grpcio python3-protobuf python3-numpy python3-scipy python3-pytest
+      - name: Build
+        run: |
+          cmake -S soapy -B soapy/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build soapy/build --parallel
+      - name: Module tests
+        run: ctest --test-dir soapy/build --output-on-failure
+      - name: Tool tests
+        working-directory: tools/tests
+        run: python3 -m pytest -q
+        env:
+          PLUTOSKY_BUILD_DIR: ${{ github.workspace }}/soapy/build
+
+  # The simulations take tens of minutes, so they run only when started by hand.
+  gateware:
+    name: Gateware
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update
+          $SUDO apt-get install -y git iverilog python3 python3-venv
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -r gateware/requirements.txt
+      - name: Simulations
+        working-directory: gateware
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -m pytest -q -m "not slow"

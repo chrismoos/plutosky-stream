@@ -1,0 +1,18 @@
+# plutosky-stream settings, read by /etc/init.d/S99plutosky.
+#
+# ETH_IPADDR   static address for eth0. Empty takes the u-boot ipaddr_eth
+#              variable, or DHCP when that is unset.
+# ETH_NETMASK  netmask that goes with ETH_IPADDR.
+# ETH_MTU      MTU for eth0. 1500 by default. 9000 needs jumbo receive, which the
+#              board has not validated.
+# DAEMON_OPTS  arguments passed to /opt/plutosky/daemon.
+# PUMP_PRIORITY  real-time FIFO priority, 1 to 98, of the kernel thread that
+#              hands received transmit frames to the FPGA. Empty leaves it at
+#              normal priority, where it can wait behind other tasks and a
+#              transmit packet close to its timestamp is dropped as late.
+
+ETH_IPADDR=192.168.1.10
+ETH_NETMASK=255.255.255.0
+ETH_MTU=1500
+DAEMON_OPTS="--csr-json /opt/plutosky/csr.json --uio /dev/uio0"
+PUMP_PRIORITY=90

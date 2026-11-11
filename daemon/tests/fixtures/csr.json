@@ -1,0 +1,646 @@
+{
+    "constants": {
+        "channels": 2,
+        "config_bus_standard": "AXI-LITE",
+        "config_clock_frequency": 100000000,
+        "config_cpu_family": "arm",
+        "config_cpu_name": "zynq7000",
+        "config_cpu_type_zynq7000": null,
+        "config_csr_alignment": 32,
+        "config_csr_data_width": 32,
+        "config_platform_name": "plutosky_7020"
+    },
+    "csr_bases": {
+        "ad9361": 1136656384,
+        "rxpkt0": 1136658432,
+        "rxpkt1": 1136660480,
+        "rxpkt2": 1136662528,
+        "rxpkt3": 1136664576,
+        "slots": 1136666624,
+        "soc": 1136668672,
+        "timebase": 1136670720,
+        "txpkt0": 1136672768,
+        "txpkt1": 1136674816,
+        "txpkt2": 1136676864,
+        "txpkt3": 1136678912
+    },
+    "csr_registers": {
+        "ad9361_config": {
+            "addr": 1136656384,
+            "size": 1,
+            "type": "rw"
+        },
+        "ad9361_ctrl": {
+            "addr": 1136656388,
+            "size": 1,
+            "type": "rw"
+        },
+        "ad9361_phy_control": {
+            "addr": 1136656428,
+            "size": 1,
+            "type": "rw"
+        },
+        "ad9361_prbs_rx": {
+            "addr": 1136656400,
+            "size": 1,
+            "type": "ro"
+        },
+        "ad9361_rx_activity": {
+            "addr": 1136656408,
+            "size": 1,
+            "type": "ro"
+        },
+        "ad9361_rx_idelay": {
+            "addr": 1136656404,
+            "size": 1,
+            "type": "rw"
+        },
+        "ad9361_spi_control": {
+            "addr": 1136656412,
+            "size": 1,
+            "type": "rw"
+        },
+        "ad9361_spi_miso": {
+            "addr": 1136656424,
+            "size": 1,
+            "type": "ro"
+        },
+        "ad9361_spi_mosi": {
+            "addr": 1136656420,
+            "size": 1,
+            "type": "rw"
+        },
+        "ad9361_spi_status": {
+            "addr": 1136656416,
+            "size": 1,
+            "type": "ro"
+        },
+        "ad9361_stat": {
+            "addr": 1136656392,
+            "size": 1,
+            "type": "ro"
+        },
+        "ad9361_test": {
+            "addr": 1136656396,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_ctrl": {
+            "addr": 1136658432,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_frame_len": {
+            "addr": 1136658440,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_header": {
+            "addr": 1136658452,
+            "size": 18,
+            "type": "rw"
+        },
+        "rxpkt0_irq_threshold": {
+            "addr": 1136658536,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_observed": {
+            "addr": 1136658548,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_overflow": {
+            "addr": 1136658532,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt0_produced": {
+            "addr": 1136658524,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt0_released": {
+            "addr": 1136658528,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_samples_per_packet": {
+            "addr": 1136658436,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_slot_count": {
+            "addr": 1136658544,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_slot_first": {
+            "addr": 1136658540,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_start_hi": {
+            "addr": 1136658444,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt0_start_lo": {
+            "addr": 1136658448,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_ctrl": {
+            "addr": 1136660480,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_frame_len": {
+            "addr": 1136660488,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_header": {
+            "addr": 1136660500,
+            "size": 18,
+            "type": "rw"
+        },
+        "rxpkt1_irq_threshold": {
+            "addr": 1136660584,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_observed": {
+            "addr": 1136660596,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_overflow": {
+            "addr": 1136660580,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt1_produced": {
+            "addr": 1136660572,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt1_released": {
+            "addr": 1136660576,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_samples_per_packet": {
+            "addr": 1136660484,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_slot_count": {
+            "addr": 1136660592,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_slot_first": {
+            "addr": 1136660588,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_start_hi": {
+            "addr": 1136660492,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt1_start_lo": {
+            "addr": 1136660496,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_ctrl": {
+            "addr": 1136662528,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_frame_len": {
+            "addr": 1136662536,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_header": {
+            "addr": 1136662548,
+            "size": 18,
+            "type": "rw"
+        },
+        "rxpkt2_irq_threshold": {
+            "addr": 1136662632,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_observed": {
+            "addr": 1136662644,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_overflow": {
+            "addr": 1136662628,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt2_produced": {
+            "addr": 1136662620,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt2_released": {
+            "addr": 1136662624,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_samples_per_packet": {
+            "addr": 1136662532,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_slot_count": {
+            "addr": 1136662640,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_slot_first": {
+            "addr": 1136662636,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_start_hi": {
+            "addr": 1136662540,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt2_start_lo": {
+            "addr": 1136662544,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_ctrl": {
+            "addr": 1136664576,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_frame_len": {
+            "addr": 1136664584,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_header": {
+            "addr": 1136664596,
+            "size": 18,
+            "type": "rw"
+        },
+        "rxpkt3_irq_threshold": {
+            "addr": 1136664680,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_observed": {
+            "addr": 1136664692,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_overflow": {
+            "addr": 1136664676,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt3_produced": {
+            "addr": 1136664668,
+            "size": 1,
+            "type": "ro"
+        },
+        "rxpkt3_released": {
+            "addr": 1136664672,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_samples_per_packet": {
+            "addr": 1136664580,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_slot_count": {
+            "addr": 1136664688,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_slot_first": {
+            "addr": 1136664684,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_start_hi": {
+            "addr": 1136664588,
+            "size": 1,
+            "type": "rw"
+        },
+        "rxpkt3_start_lo": {
+            "addr": 1136664592,
+            "size": 1,
+            "type": "rw"
+        },
+        "slots_count": {
+            "addr": 1136666632,
+            "size": 1,
+            "type": "rw"
+        },
+        "slots_pool_base": {
+            "addr": 1136666624,
+            "size": 1,
+            "type": "rw"
+        },
+        "slots_rx_offset": {
+            "addr": 1136666640,
+            "size": 1,
+            "type": "rw"
+        },
+        "slots_slot_size": {
+            "addr": 1136666628,
+            "size": 1,
+            "type": "rw"
+        },
+        "slots_tx_offset": {
+            "addr": 1136666636,
+            "size": 1,
+            "type": "rw"
+        },
+        "soc_magic_value": {
+            "addr": 1136668672,
+            "size": 1,
+            "type": "ro"
+        },
+        "soc_version_value": {
+            "addr": 1136668676,
+            "size": 1,
+            "type": "ro"
+        },
+        "timebase_arm_hi": {
+            "addr": 1136670740,
+            "size": 1,
+            "type": "rw"
+        },
+        "timebase_arm_lo": {
+            "addr": 1136670744,
+            "size": 1,
+            "type": "rw"
+        },
+        "timebase_ctrl": {
+            "addr": 1136670720,
+            "size": 1,
+            "type": "rw"
+        },
+        "timebase_load_hi": {
+            "addr": 1136670732,
+            "size": 1,
+            "type": "rw"
+        },
+        "timebase_load_lo": {
+            "addr": 1136670736,
+            "size": 1,
+            "type": "rw"
+        },
+        "timebase_now_hi": {
+            "addr": 1136670724,
+            "size": 1,
+            "type": "ro"
+        },
+        "timebase_now_lo": {
+            "addr": 1136670728,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_bad_id": {
+            "addr": 1136672800,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_consumed": {
+            "addr": 1136672780,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_consumed_count": {
+            "addr": 1136672784,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_ctrl": {
+            "addr": 1136672768,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt0_fifo_level": {
+            "addr": 1136672804,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_irq_threshold": {
+            "addr": 1136672808,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt0_gaps": {
+            "addr": 1136672796,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_late": {
+            "addr": 1136672788,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt0_stream_id": {
+            "addr": 1136672772,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt0_submit": {
+            "addr": 1136672776,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt0_underrun": {
+            "addr": 1136672792,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_bad_id": {
+            "addr": 1136674848,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_consumed": {
+            "addr": 1136674828,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_consumed_count": {
+            "addr": 1136674832,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_ctrl": {
+            "addr": 1136674816,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt1_fifo_level": {
+            "addr": 1136674852,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_irq_threshold": {
+            "addr": 1136674856,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt1_gaps": {
+            "addr": 1136674844,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_late": {
+            "addr": 1136674836,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt1_stream_id": {
+            "addr": 1136674820,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt1_submit": {
+            "addr": 1136674824,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt1_underrun": {
+            "addr": 1136674840,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_bad_id": {
+            "addr": 1136676896,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_consumed": {
+            "addr": 1136676876,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_consumed_count": {
+            "addr": 1136676880,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_ctrl": {
+            "addr": 1136676864,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt2_fifo_level": {
+            "addr": 1136676900,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_irq_threshold": {
+            "addr": 1136676904,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt2_gaps": {
+            "addr": 1136676892,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_late": {
+            "addr": 1136676884,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt2_stream_id": {
+            "addr": 1136676868,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt2_submit": {
+            "addr": 1136676872,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt2_underrun": {
+            "addr": 1136676888,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_bad_id": {
+            "addr": 1136678944,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_consumed": {
+            "addr": 1136678924,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_consumed_count": {
+            "addr": 1136678928,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_ctrl": {
+            "addr": 1136678912,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt3_fifo_level": {
+            "addr": 1136678948,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_irq_threshold": {
+            "addr": 1136678952,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt3_gaps": {
+            "addr": 1136678940,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_late": {
+            "addr": 1136678932,
+            "size": 1,
+            "type": "ro"
+        },
+        "txpkt3_stream_id": {
+            "addr": 1136678916,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt3_submit": {
+            "addr": 1136678920,
+            "size": 1,
+            "type": "rw"
+        },
+        "txpkt3_underrun": {
+            "addr": 1136678936,
+            "size": 1,
+            "type": "ro"
+        }
+    },
+    "memories": {
+        "csr": {
+            "base": 1136656384,
+            "size": 65536,
+            "type": "io"
+        }
+    }
+}

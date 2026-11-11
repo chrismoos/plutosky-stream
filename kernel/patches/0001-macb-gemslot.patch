@@ -1,0 +1,2389 @@
+diff --git a/drivers/net/ethernet/cadence/Makefile b/drivers/net/ethernet/cadence/Makefile
+index 1f33cdca9..f5ca4b908 100644
+--- a/drivers/net/ethernet/cadence/Makefile
++++ b/drivers/net/ethernet/cadence/Makefile
+@@ -2,7 +2,7 @@
+ #
+ # Makefile for the Atmel network device drivers.
+ #
+-macb-y	:= macb_main.o
++macb-y	:= macb_main.o macb_gemslot.o
+ 
+ ifeq ($(CONFIG_MACB_USE_HWSTAMP),y)
+ macb-y	+= macb_ptp.o
+diff --git a/drivers/net/ethernet/cadence/macb.h b/drivers/net/ethernet/cadence/macb.h
+index 5bdffefb5..fd3194a32 100644
+--- a/drivers/net/ethernet/cadence/macb.h
++++ b/drivers/net/ethernet/cadence/macb.h
+@@ -944,6 +944,8 @@ struct macb_tx_skb {
+ 	dma_addr_t		mapping;
+ 	size_t			size;
+ 	bool			mapped_as_page;
++	bool			slot;
++	u16			slot_index;
+ };
+ 
+ /* Hardware-collected statistics. Used when updating the network
+@@ -1162,6 +1164,8 @@ struct macb_or_gem_ops {
+ };
+ 
+ /* MACB-PTP interface: adapt to platform needs. */
++struct gemslot_dev;
++
+ struct macb_ptp_info {
+ 	void (*ptp_init)(struct net_device *ndev);
+ 	void (*ptp_remove)(struct net_device *ndev);
+@@ -1230,6 +1234,7 @@ struct macb_queue {
+ 	unsigned int		rx_prepared_head;
+ 	struct macb_dma_desc	*rx_ring;
+ 	struct sk_buff		**rx_skbuff;
++	u16			*rx_slot;
+ 	void			*rx_buffers;
+ 	struct napi_struct	napi;
+ 	struct queue_stats stats;
+@@ -1310,6 +1315,8 @@ struct macb {
+ 	/* holds value of rx watermark value for pbuf_rxcutthru register */
+ 	u16			rx_watermark;
+ 
++	struct gemslot_dev	*gemslot;
++
+ 	struct macb_ptp_info	*ptp_info;	/* macb-ptp interface */
+ 
+ 	struct phy		*sgmii_phy;	/* for ZynqMP SGMII mode */
+diff --git a/drivers/net/ethernet/cadence/macb_gemslot.c b/drivers/net/ethernet/cadence/macb_gemslot.c
+new file mode 100644
+index 000000000..5565929f6
+--- /dev/null
++++ b/drivers/net/ethernet/cadence/macb_gemslot.c
+@@ -0,0 +1,1163 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GEM slot fast path for the Zynq-7000 GEM.
++ *
++ * A reserved-memory pool holds two rings of fixed-size slots. The PL writes
++ * finished frames into transmit slots and reads host frames out of receive
++ * slots. The kernel moves slot indices between GEM and the PL without copying
++ * samples. User space configures and stops the streams.
++ */
++
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/etherdevice.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/interrupt.h>
++#include <linux/kthread.h>
++#include <linux/jiffies.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/platform_device.h>
++#include <linux/sched.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <asm/unaligned.h>
++
++#include "macb.h"
++#include "macb_gemslot.h"
++
++#define GEMSLOT_DDRC_MODE_STS_PHYS 0xf8006054
++
++static u32 gemslot_slots = GEMSLOT_SLOT_COUNT;
++#define GEMSLOT_TX_IRQ_BATCH 8u
++module_param_named(slots, gemslot_slots, uint, 0444);
++MODULE_PARM_DESC(slots, "Slots per ring in the GEM slot pool");
++
++bool macb_gemslot_jumbo = true;
++module_param_named(jumbo, macb_gemslot_jumbo, bool, 0444);
++MODULE_PARM_DESC(jumbo, "Offer a 9000 byte MTU and jumbo receive buffers");
++
++bool macb_gemslot_fast_tx;
++module_param_named(fast_tx, macb_gemslot_fast_tx, bool, 0644);
++MODULE_PARM_DESC(fast_tx, "Transmit GEM slots from their DMA descriptors");
++
++static struct gemslot_dev *gemslot_of_file(struct file *file)
++{
++	return container_of(file->private_data, struct gemslot_dev, misc);
++}
++
++static void gemslot_pump_wake(struct gemslot_dev *gs)
++{
++	if (gs->pump_task) {
++		atomic_set(&gs->pump_event, 1);
++		wake_up_interruptible(&gs->pump_wq);
++	}
++}
++
++void macb_gemslot_wake(struct gemslot_dev *gs)
++{
++	wake_up_interruptible(&gs->wq);
++	if (READ_ONCE(gs->direct[GEMSLOT_STREAM_TX].active))
++		gemslot_pump_wake(gs);
++}
++
++void macb_gemslot_tx_done(struct gemslot_dev *gs, u16 slot, u16 len)
++{
++	unsigned long flags;
++	int idx;
++
++	spin_lock_irqsave(&gs->tx_lock, flags);
++	idx = gemslot_ring_push(&gs->tx_comp);
++	if (idx >= 0) {
++		gs->tx_comp_buf[idx].slot = slot;
++		gs->tx_comp_buf[idx].len = len;
++		gs->tx_frames++;
++	}
++	spin_unlock_irqrestore(&gs->tx_lock, flags);
++
++	/* This runs per completed frame, so keep it to a list check when the
++	 * daemon is not in GEMSLOT_WAIT.
++	 */
++	if (waitqueue_active(&gs->wq))
++		wake_up_interruptible(&gs->wq);
++	if (idx < 0)
++		netdev_warn_once(gs->bp->dev,
++				 "gemslot: transmit completion ring overrun, slot %u lost\n",
++				 slot);
++}
++
++int macb_gemslot_take_slot(struct gemslot_dev *gs)
++{
++	unsigned long flags;
++	int idx;
++	int slot = -1;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	idx = gemslot_ring_pop(&gs->rx_free);
++	if (idx >= 0)
++		slot = gs->rx_free_buf[idx];
++	else
++		gs->rx_starved++;
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	return slot;
++}
++
++void macb_gemslot_put_slot(struct gemslot_dev *gs, u16 slot)
++{
++	unsigned long flags;
++	int idx;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	idx = gemslot_ring_push(&gs->rx_free);
++	if (idx >= 0)
++		gs->rx_free_buf[idx] = slot;
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	/* The free ring is larger than the slot count, so a push cannot fail
++	 * unless a slot was returned twice.
++	 */
++	if (idx < 0)
++		netdev_warn_once(gs->bp->dev,
++				 "gemslot: free ring full, receive slot %u returned twice\n",
++				 slot);
++}
++
++/* Take a slot back from the daemon, refusing one it was not holding. */
++int macb_gemslot_return_slot(struct gemslot_dev *gs, u16 slot)
++{
++	unsigned long flags;
++	int idx;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	if (!gemslot_bit_test(gs->rx_outstanding, slot)) {
++		spin_unlock_irqrestore(&gs->rx_lock, flags);
++		return -EINVAL;
++	}
++	gemslot_bit_assign(gs->rx_outstanding, slot, 0);
++
++	idx = gemslot_ring_push(&gs->rx_free);
++	if (idx >= 0)
++		gs->rx_free_buf[idx] = slot;
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	return idx < 0 ? -ENOSPC : 0;
++}
++
++void macb_gemslot_deliver(struct gemslot_dev *gs, u16 slot, u16 len)
++{
++	unsigned long flags;
++	int idx;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	idx = gemslot_ring_push(&gs->rx_steer);
++	if (idx >= 0) {
++		gs->rx_steer_buf[idx].slot = slot;
++		gs->rx_steer_buf[idx].len = len;
++		gs->rx_steered++;
++		gemslot_bit_assign(gs->rx_outstanding, slot, 1);
++	}
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	/* A daemon that stops reading must not leak the slot out of the ring. */
++	if (idx < 0)
++		macb_gemslot_put_slot(gs, slot);
++}
++
++static u32 gemslot_tx_pending(struct gemslot_dev *gs)
++{
++	unsigned long flags;
++	u32 n;
++
++	spin_lock_irqsave(&gs->tx_lock, flags);
++	n = gemslot_ring_count(&gs->tx_comp);
++	spin_unlock_irqrestore(&gs->tx_lock, flags);
++
++	return n;
++}
++
++static u32 gemslot_rx_pending(struct gemslot_dev *gs)
++{
++	unsigned long flags;
++	u32 n;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	n = gemslot_ring_count(&gs->rx_steer);
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	return n;
++}
++
++/* Seed the receive pool once, before GEM owns any descriptor. */
++static void macb_gemslot_init_pool(struct macb *bp)
++{
++	struct gemslot_dev *gs = bp->gemslot;
++	unsigned long flags;
++	u32 i;
++
++	if (!gs)
++		return;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	gemslot_ring_init(&gs->rx_steer, GEMSLOT_STEER_RING);
++	gemslot_ring_init(&gs->rx_free, GEMSLOT_FREE_RING);
++	memset(gs->rx_outstanding, 0, BITS_TO_BYTES(gs->slot_count));
++	for (i = 0; i < gs->slot_count; i++) {
++		int idx = gemslot_ring_push(&gs->rx_free);
++
++		if (idx < 0)
++			break;
++		gs->rx_free_buf[idx] = (u16)i;
++	}
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++}
++
++static u32 gemslot_csr_read(struct gemslot_dev *gs, u32 addr)
++{
++	return readl((u8 __iomem *)gs->csr + addr);
++}
++
++static void gemslot_csr_write(struct gemslot_dev *gs, u32 addr, u32 value)
++{
++	writel(value, (u8 __iomem *)gs->csr + addr);
++}
++
++static bool gemslot_csr_valid(struct gemslot_dev *gs, u32 addr)
++{
++	return gs->csr && addr <= gs->csr_size - sizeof(u32) &&
++	       !(addr & (sizeof(u32) - 1));
++}
++
++static u64 gemslot_packet_end(struct gemslot_dev *gs, u16 slot, u32 format,
++			      u16 frame_len, u64 previous)
++{
++	const u8 *frame = (u8 *)gemslot_va(gs, false, slot) +
++			  GEMSLOT_FRAME_OFFSET;
++	const u8 *vita = frame + ETH_HLEN + 20 + 8;
++	u32 header, payload, samples;
++	u64 ticks;
++
++	if (frame_len < ETH_HLEN + 20 + 8 + 24)
++		return previous;
++	header = get_unaligned_be32(vita);
++	if (header >> 28 != 1 || !(header & BIT(27)) ||
++	    (header & (0xf << 20)) != BIT(20))
++		return previous;
++	payload = (header & 0xffff) * sizeof(u32);
++	if (payload > frame_len - ETH_HLEN - 20 - 8)
++		return previous;
++	if (payload < 24 + ((header & BIT(26)) ? sizeof(u32) : 0))
++		return previous;
++	payload -= 24 + ((header & BIT(26)) ? sizeof(u32) : 0);
++	switch (format) {
++	case 0:
++		samples = payload / 3;
++		break;
++	case 1:
++		samples = payload / 2;
++		break;
++	case 2:
++		samples = payload / 33 * 16;
++		break;
++	default:
++		return previous;
++	}
++	ticks = get_unaligned_be64(vita + 16);
++	return max(previous, ticks + samples);
++}
++
++static bool gemslot_pump_rx(struct gemslot_dev *gs,
++			    struct gemslot_direct_stream *stream)
++{
++	struct gemslot_tx_entry batch[GEMSLOT_BATCH_MAX];
++	u32 produced, count, i;
++	unsigned long flags;
++	bool progress = false;
++	int accepted;
++
++	spin_lock_irqsave(&gs->tx_lock, flags);
++	while (gemslot_ring_count(&gs->tx_comp)) {
++		int idx = gemslot_ring_pop(&gs->tx_comp);
++		u16 expected = stream->config.slot_first +
++			(stream->released - stream->base) % stream->config.slot_count;
++
++		if (gs->tx_comp_buf[idx].slot != expected) {
++			stream->dropped++;
++			gemslot_csr_write(gs, stream->config.ctrl, 0);
++			stream->stopping = true;
++			continue;
++		}
++		stream->released++;
++		stream->completed++;
++		progress = true;
++	}
++	spin_unlock_irqrestore(&gs->tx_lock, flags);
++	if (progress)
++		gemslot_csr_write(gs, stream->config.released, stream->released);
++
++	produced = gemslot_csr_read(gs, stream->config.produced);
++	stream->produced += (u32)(produced - stream->last_produced);
++	stream->last_produced = produced;
++	gemslot_csr_write(gs, stream->config.observed, produced);
++	if ((u32)(produced - stream->released) > stream->config.slot_count) {
++		stream->dropped += produced - stream->released -
++				   stream->config.slot_count;
++		gemslot_csr_write(gs, stream->config.ctrl, 0);
++		stream->stopping = true;
++		return false;
++	}
++
++	count = min_t(u32, produced - stream->queued, GEMSLOT_BATCH_MAX);
++	for (i = 0; i < count; i++) {
++		batch[i].slot = stream->config.slot_first +
++			(stream->queued + i - stream->base) %
++			stream->config.slot_count;
++		batch[i].len = stream->config.frame_len;
++	}
++	if (!count)
++		return progress;
++	accepted = macb_gemslot_submit(gs->bp, batch, count);
++	if (accepted < 0) {
++		stream->dropped += count;
++		gemslot_csr_write(gs, stream->config.ctrl, 0);
++		stream->stopping = true;
++		return progress;
++	}
++	stream->queued += accepted;
++	stream->submitted += accepted;
++	return progress || accepted != 0;
++}
++
++static bool gemslot_pump_tx(struct gemslot_dev *gs,
++			    struct gemslot_direct_stream *stream)
++{
++	unsigned long flags;
++	u32 ready, i;
++	bool progress = false;
++
++	ready = gemslot_csr_read(gs, stream->config.consumed_count);
++	for (i = 0; i < ready &&
++	     stream->inflight_tail != stream->inflight_head; i++) {
++		u32 index = stream->inflight_tail++ % GEMSLOT_BATCH_MAX;
++		u16 slot = stream->inflight[index];
++
++		gemslot_csr_read(gs, stream->config.consumed);
++		stream->consumed_ticks = max(stream->consumed_ticks,
++					     stream->end_ticks[index]);
++		if (macb_gemslot_return_slot(gs, slot)) {
++			stream->dropped++;
++			gemslot_csr_write(gs, stream->config.ctrl, 0);
++			stream->stopping = true;
++		}
++		stream->completed++;
++		progress = true;
++	}
++	if (i != ready)
++		stream->dropped += ready - i;
++
++	while (stream->inflight_head - stream->inflight_tail <
++	       GEMSLOT_BATCH_MAX) {
++		struct gemslot_rx_entry entry;
++		int idx;
++		u32 index;
++
++		spin_lock_irqsave(&gs->rx_lock, flags);
++		idx = gemslot_ring_pop(&gs->rx_steer);
++		if (idx >= 0)
++			entry = gs->rx_steer_buf[idx];
++		spin_unlock_irqrestore(&gs->rx_lock, flags);
++		if (idx < 0)
++			break;
++		index = stream->inflight_head++ % GEMSLOT_BATCH_MAX;
++		stream->inflight[index] = entry.slot;
++		stream->end_ticks[index] = gemslot_packet_end(gs, entry.slot,
++			stream->config.format, entry.len, stream->consumed_ticks);
++		gemslot_csr_write(gs, stream->config.submit,
++				  (u32)entry.len << 16 | entry.slot);
++		stream->submitted++;
++		progress = true;
++	}
++	stream->produced = stream->submitted;
++	return progress;
++}
++
++static bool gemslot_direct_drained(struct gemslot_dev *gs,
++				   struct gemslot_direct_stream *stream);
++
++static int gemslot_pump_thread(void *data)
++{
++	struct gemslot_dev *gs = data;
++
++	while (!kthread_should_stop()) {
++		bool progress;
++		int budget = 16;
++		long timeout = READ_ONCE(gs->direct[GEMSLOT_STREAM_RX].active) ||
++			READ_ONCE(gs->direct[GEMSLOT_STREAM_TX].active) ?
++			msecs_to_jiffies(1) : MAX_SCHEDULE_TIMEOUT;
++
++		wait_event_interruptible_timeout(gs->pump_wq,
++			atomic_xchg(&gs->pump_event, 0) ||
++			kthread_should_stop(), timeout);
++		if (kthread_should_stop())
++			break;
++		mutex_lock(&gs->pump_lock);
++		macb_gemslot_poll_tx(gs->bp,
++			gs->direct[GEMSLOT_STREAM_RX].active);
++		do {
++			progress = false;
++			if (gs->direct[GEMSLOT_STREAM_RX].active)
++				progress |= gemslot_pump_rx(gs,
++					&gs->direct[GEMSLOT_STREAM_RX]);
++			if (gs->direct[GEMSLOT_STREAM_TX].active)
++				progress |= gemslot_pump_tx(gs,
++					&gs->direct[GEMSLOT_STREAM_TX]);
++		} while (progress && --budget);
++		if (gs->direct[GEMSLOT_STREAM_RX].stopping &&
++		    gemslot_direct_drained(gs,
++			&gs->direct[GEMSLOT_STREAM_RX])) {
++			gs->direct[GEMSLOT_STREAM_RX].active = false;
++			gs->direct[GEMSLOT_STREAM_RX].stopping = false;
++		}
++		if (gs->direct[GEMSLOT_STREAM_TX].stopping &&
++		    gemslot_direct_drained(gs,
++			&gs->direct[GEMSLOT_STREAM_TX])) {
++			gs->direct[GEMSLOT_STREAM_TX].active = false;
++			gs->direct[GEMSLOT_STREAM_TX].stopping = false;
++		}
++		if (!gs->direct[GEMSLOT_STREAM_RX].active)
++			macb_gemslot_poll_tx(gs->bp, false);
++		mutex_unlock(&gs->pump_lock);
++		if (atomic_cmpxchg(&gs->pump_irq_masked, 1, 0) == 1)
++			enable_irq(gs->pump_irq);
++	}
++	return 0;
++}
++
++static irqreturn_t gemslot_pump_interrupt(int irq, void *data)
++{
++	struct gemslot_dev *gs = data;
++
++	disable_irq_nosync(irq);
++	atomic_set(&gs->pump_irq_masked, 1);
++	gemslot_pump_wake(gs);
++	return IRQ_HANDLED;
++}
++
++static bool gemslot_direct_drained(struct gemslot_dev *gs,
++				   struct gemslot_direct_stream *stream)
++{
++	if (stream->config.direction == GEMSLOT_STREAM_RX)
++		return stream->queued == stream->released &&
++		       stream->queued ==
++		       gemslot_csr_read(gs, stream->config.produced);
++	return stream->inflight_head == stream->inflight_tail &&
++	       !gemslot_rx_pending(gs);
++}
++
++static void gemslot_direct_quiesce(struct gemslot_dev *gs,
++				   struct gemslot_direct_stream *stream)
++{
++	gemslot_csr_write(gs, stream->config.ctrl, 0);
++	if (stream->config.direction == GEMSLOT_STREAM_RX)
++		gemslot_csr_write(gs, stream->config.irq_threshold, 0);
++	else {
++		gemslot_csr_write(gs, stream->config.tx_irq_threshold, 0);
++		gemslot_bit_assign(gs->portmap, stream->config.udp_port, 0);
++	}
++	stream->stopping = true;
++	gemslot_pump_wake(gs);
++}
++
++void macb_gemslot_link_down(struct gemslot_dev *gs)
++{
++	u32 direction;
++
++	if (!gs)
++		return;
++	mutex_lock(&gs->pump_lock);
++	for (direction = GEMSLOT_STREAM_RX;
++	     direction <= GEMSLOT_STREAM_TX; direction++) {
++		if (gs->direct[direction].active)
++			gemslot_direct_quiesce(gs, &gs->direct[direction]);
++	}
++	mutex_unlock(&gs->pump_lock);
++}
++
++void macb_gemslot_fault(struct gemslot_dev *gs)
++{
++	struct gemslot_direct_stream *stream;
++
++	if (!gs)
++		return;
++	stream = &gs->direct[GEMSLOT_STREAM_RX];
++	if (READ_ONCE(stream->active)) {
++		gemslot_csr_write(gs, stream->config.ctrl, 0);
++		gemslot_csr_write(gs, stream->config.irq_threshold, 0);
++		WRITE_ONCE(stream->stopping, true);
++	}
++	stream = &gs->direct[GEMSLOT_STREAM_TX];
++	if (READ_ONCE(stream->active)) {
++		gemslot_csr_write(gs, stream->config.ctrl, 0);
++		gemslot_csr_write(gs, stream->config.tx_irq_threshold, 0);
++		gemslot_bit_assign(gs->portmap, stream->config.udp_port, 0);
++		WRITE_ONCE(stream->stopping, true);
++	}
++	gemslot_pump_wake(gs);
++}
++
++static int gemslot_direct_stop(struct gemslot_dev *gs, struct file *file,
++			       u32 direction)
++{
++	struct gemslot_direct_stream *stream;
++	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
++	int ret = 0;
++
++	if (direction > GEMSLOT_STREAM_TX)
++		return -EINVAL;
++	stream = &gs->direct[direction];
++	mutex_lock(&gs->pump_lock);
++	if (stream->owner != file) {
++		mutex_unlock(&gs->pump_lock);
++		return -ENOENT;
++	}
++	if (!stream->active && !stream->stopping) {
++		mutex_unlock(&gs->pump_lock);
++		return 0;
++	}
++	gemslot_direct_quiesce(gs, stream);
++	mutex_unlock(&gs->pump_lock);
++
++	do {
++		gemslot_pump_wake(gs);
++		msleep(1);
++		mutex_lock(&gs->pump_lock);
++		if (gemslot_direct_drained(gs, stream)) {
++			stream->active = false;
++			stream->stopping = false;
++			if (direction == GEMSLOT_STREAM_RX)
++				macb_gemslot_poll_tx(gs->bp, false);
++			mutex_unlock(&gs->pump_lock);
++			return 0;
++		}
++		mutex_unlock(&gs->pump_lock);
++	} while (time_before(jiffies, deadline));
++
++	ret = -ETIMEDOUT;
++	return ret;
++}
++
++static long gemslot_direct_start(struct gemslot_dev *gs, struct file *file,
++				 void __user *arg)
++{
++	struct gemslot_stream_config cfg;
++	struct gemslot_direct_stream *stream;
++	u32 first, last;
++	long ret = 0;
++
++	if (copy_from_user(&cfg, arg, sizeof(cfg)))
++		return -EFAULT;
++	if (!gs->csr || !gs->pump_task || gs->pump_irq <= 0)
++		return -ENODEV;
++	if (cfg.direction > GEMSLOT_STREAM_TX || cfg.instance >= 4 ||
++	    !cfg.slot_count || cfg.slot_first >= gs->slot_count ||
++	    cfg.slot_count > gs->slot_count - cfg.slot_first ||
++	    !gemslot_csr_valid(gs, cfg.ctrl) || cfg.format > 2)
++		return -EINVAL;
++	if (cfg.direction == GEMSLOT_STREAM_RX) {
++		if (!cfg.frame_len || cfg.frame_len >
++		    min_t(u32, gs->slot_size - GEMSLOT_FRAME_OFFSET,
++			  gs->bp->dev->mtu + ETH_HLEN) ||
++		    !gemslot_csr_valid(gs, cfg.produced) ||
++		    !gemslot_csr_valid(gs, cfg.observed) ||
++		    !gemslot_csr_valid(gs, cfg.released) ||
++		    !gemslot_csr_valid(gs, cfg.irq_threshold))
++			return -EINVAL;
++	} else if (!cfg.udp_port || cfg.udp_port > U16_MAX ||
++		   !gemslot_csr_valid(gs, cfg.submit) ||
++		   !gemslot_csr_valid(gs, cfg.consumed) ||
++		   !gemslot_csr_valid(gs, cfg.consumed_count) ||
++		   !gemslot_csr_valid(gs, cfg.tx_irq_threshold)) {
++		return -EINVAL;
++	}
++	if (!netif_running(gs->bp->dev))
++		return -ENETDOWN;
++	stream = &gs->direct[cfg.direction];
++	mutex_lock(&gs->pump_lock);
++	if (stream->active || stream->stopping) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (cfg.direction == GEMSLOT_STREAM_RX) {
++		if (gemslot_tx_pending(gs)) {
++			ret = -EBUSY;
++			goto out;
++		}
++	} else if (gemslot_rx_pending(gs) ||
++		   gemslot_bit_test(gs->portmap, cfg.udp_port)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	memset(stream, 0, sizeof(*stream));
++	stream->config = cfg;
++	stream->owner = file;
++	if (cfg.direction == GEMSLOT_STREAM_RX) {
++		stream->base = gemslot_csr_read(gs, cfg.produced);
++		stream->last_produced = stream->base;
++		stream->queued = stream->base;
++		stream->released = stream->base;
++		gemslot_csr_write(gs, cfg.observed, stream->base);
++		gemslot_csr_write(gs, cfg.released, stream->base);
++		gemslot_csr_write(gs, cfg.irq_threshold, 8);
++	} else {
++		first = gemslot_csr_read(gs, cfg.consumed_count);
++		for (last = 0; last < first; last++)
++			gemslot_csr_read(gs, cfg.consumed);
++		gemslot_bit_assign(gs->portmap, cfg.udp_port, 1);
++		gemslot_csr_write(gs, cfg.tx_irq_threshold,
++				  GEMSLOT_TX_IRQ_BATCH);
++	}
++	stream->active = true;
++	gemslot_pump_wake(gs);
++out:
++	mutex_unlock(&gs->pump_lock);
++	return ret;
++}
++
++static long gemslot_direct_status(struct gemslot_dev *gs, struct file *file,
++				  void __user *arg)
++{
++	struct gemslot_stream_status status;
++	struct gemslot_direct_stream *stream;
++
++	if (copy_from_user(&status, arg, sizeof(status)))
++		return -EFAULT;
++	if (status.direction > GEMSLOT_STREAM_TX)
++		return -EINVAL;
++	mutex_lock(&gs->pump_lock);
++	stream = &gs->direct[status.direction];
++	if (stream->owner != file) {
++		mutex_unlock(&gs->pump_lock);
++		return -ENOENT;
++	}
++	status.active = stream->active && !stream->stopping;
++	status.produced = stream->produced;
++	status.submitted = stream->submitted;
++	status.completed = stream->completed;
++	status.consumed_ticks = stream->consumed_ticks;
++	status.dropped = stream->dropped;
++	mutex_unlock(&gs->pump_lock);
++	return copy_to_user(arg, &status, sizeof(status)) ? -EFAULT : 0;
++}
++
++static long gemslot_get_info(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_info info = {
++		.pool_phys = (u32)gs->pool_phys,
++		.pool_size = (u32)gs->pool_size,
++		.slot_size = gs->slot_size,
++		.slot_count = gs->slot_count,
++		.tx_offset = gs->tx_offset,
++		.rx_offset = gs->rx_offset,
++	};
++
++	return copy_to_user(arg, &info, sizeof(info)) ? -EFAULT : 0;
++}
++
++static long gemslot_tx_submit(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_tx_batch batch;
++	u32 max_len;
++	u32 i;
++
++	if (READ_ONCE(gs->direct[GEMSLOT_STREAM_RX].active))
++		return -EBUSY;
++
++	if (copy_from_user(&batch, arg, sizeof(batch)))
++		return -EFAULT;
++	if (batch.count > GEMSLOT_BATCH_MAX)
++		return -EINVAL;
++
++	/* GEM appends the FCS, so a frame reaches the wire four bytes longer. */
++	max_len = min_t(u32, gs->slot_size - GEMSLOT_FRAME_OFFSET,
++			gs->bp->dev->mtu + ETH_HLEN);
++
++	for (i = 0; i < batch.count; i++) {
++		if (batch.entries[i].slot >= gs->slot_count)
++			return -EINVAL;
++		if (batch.entries[i].len < ETH_ZLEN ||
++		    batch.entries[i].len > max_len)
++			return -EINVAL;
++	}
++
++	return macb_gemslot_submit(gs->bp, batch.entries, batch.count);
++}
++
++static long gemslot_tx_completions(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_tx_batch batch = { .count = 0 };
++	unsigned long flags;
++
++	if (READ_ONCE(gs->direct[GEMSLOT_STREAM_RX].active))
++		return -EBUSY;
++
++	spin_lock_irqsave(&gs->tx_lock, flags);
++	while (batch.count < GEMSLOT_BATCH_MAX) {
++		int idx = gemslot_ring_pop(&gs->tx_comp);
++
++		if (idx < 0)
++			break;
++		batch.entries[batch.count++] = gs->tx_comp_buf[idx];
++	}
++	spin_unlock_irqrestore(&gs->tx_lock, flags);
++
++	if (copy_to_user(arg, &batch, sizeof(batch)))
++		return -EFAULT;
++
++	return batch.count;
++}
++
++static long gemslot_rx_steer(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_steer steer;
++
++	if (READ_ONCE(gs->direct[GEMSLOT_STREAM_TX].active))
++		return -EBUSY;
++
++	if (copy_from_user(&steer, arg, sizeof(steer)))
++		return -EFAULT;
++	if (!steer.udp_port || steer.udp_port > U16_MAX)
++		return -EINVAL;
++
++	gemslot_bit_assign(gs->portmap, steer.udp_port, steer.enable ? 1 : 0);
++
++	return 0;
++}
++
++static long gemslot_rx_poll(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_rx_batch batch = { .count = 0 };
++	unsigned long flags;
++
++	if (READ_ONCE(gs->direct[GEMSLOT_STREAM_TX].active))
++		return -EBUSY;
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	while (batch.count < GEMSLOT_BATCH_MAX) {
++		int idx = gemslot_ring_pop(&gs->rx_steer);
++
++		if (idx < 0)
++			break;
++		batch.entries[batch.count++] = gs->rx_steer_buf[idx];
++	}
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	if (copy_to_user(arg, &batch, sizeof(batch)))
++		return -EFAULT;
++
++	return batch.count;
++}
++
++static long gemslot_rx_return(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_rx_batch batch;
++	u32 i;
++
++	if (READ_ONCE(gs->direct[GEMSLOT_STREAM_TX].active))
++		return -EBUSY;
++
++	if (copy_from_user(&batch, arg, sizeof(batch)))
++		return -EFAULT;
++	if (batch.count > GEMSLOT_BATCH_MAX)
++		return -EINVAL;
++
++	for (i = 0; i < batch.count; i++)
++		if (batch.entries[i].slot >= gs->slot_count)
++			return -EINVAL;
++
++	for (i = 0; i < batch.count; i++) {
++		int err = macb_gemslot_return_slot(gs, batch.entries[i].slot);
++
++		if (err)
++			return i ? (long)i : err;
++	}
++
++	return batch.count;
++}
++
++static bool gemslot_wait_ready(struct gemslot_dev *gs,
++			       const struct gemslot_wait *w)
++{
++	if ((w->events & GEMSLOT_EVENT_TX) &&
++	    gemslot_tx_pending(gs) >= max(w->tx_threshold, 1u))
++		return true;
++	if ((w->events & GEMSLOT_EVENT_RX) &&
++	    gemslot_rx_pending(gs) >= max(w->rx_threshold, 1u))
++		return true;
++
++	return false;
++}
++
++static long gemslot_wait(struct gemslot_dev *gs, void __user *arg)
++{
++	struct gemslot_wait w;
++	long ret = 0;
++
++	if (copy_from_user(&w, arg, sizeof(w)))
++		return -EFAULT;
++	if (!(w.events & (GEMSLOT_EVENT_TX | GEMSLOT_EVENT_RX)))
++		return -EINVAL;
++
++	if (w.timeout_ms && !gemslot_wait_ready(gs, &w)) {
++		ret = wait_event_interruptible_timeout(gs->wq,
++						       gemslot_wait_ready(gs, &w),
++						       msecs_to_jiffies(w.timeout_ms));
++		if (ret < 0)
++			return ret;
++	}
++
++	w.tx_pending = gemslot_tx_pending(gs);
++	w.rx_pending = gemslot_rx_pending(gs);
++
++	if (copy_to_user(arg, &w, sizeof(w)))
++		return -EFAULT;
++
++	return 0;
++}
++
++static long gemslot_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct gemslot_dev *gs = gemslot_of_file(file);
++	void __user *p = (void __user *)arg;
++
++	switch (cmd) {
++	case GEMSLOT_GET_INFO:
++		return gemslot_get_info(gs, p);
++	case GEMSLOT_TX_SUBMIT:
++		return gemslot_tx_submit(gs, p);
++	case GEMSLOT_TX_COMPLETIONS:
++		return gemslot_tx_completions(gs, p);
++	case GEMSLOT_RX_STEER:
++		return gemslot_rx_steer(gs, p);
++	case GEMSLOT_RX_POLL:
++		return gemslot_rx_poll(gs, p);
++	case GEMSLOT_RX_RETURN:
++		return gemslot_rx_return(gs, p);
++	case GEMSLOT_WAIT:
++		return gemslot_wait(gs, p);
++	case GEMSLOT_STREAM_START:
++		return gemslot_direct_start(gs, file, p);
++	case GEMSLOT_STREAM_STOP: {
++		u32 direction;
++
++		if (get_user(direction, (u32 __user *)p))
++			return -EFAULT;
++		return gemslot_direct_stop(gs, file, direction);
++	}
++	case GEMSLOT_STREAM_STATUS:
++		return gemslot_direct_status(gs, file, p);
++	case GEMSLOT_GET_CAPS: {
++		u32 caps = gs->csr && gs->pump_task && gs->pump_irq > 0 ?
++			   GEMSLOT_CAP_KERNEL_PUMP : 0;
++
++		return put_user(caps, (u32 __user *)p);
++	}
++	default:
++		return -ENOTTY;
++	}
++}
++
++static int gemslot_release(struct inode *inode, struct file *file)
++{
++	struct gemslot_dev *gs = gemslot_of_file(file);
++	u32 direction;
++
++	for (direction = GEMSLOT_STREAM_RX;
++	     direction <= GEMSLOT_STREAM_TX; direction++) {
++		if (READ_ONCE(gs->direct[direction].owner) == file)
++			gemslot_direct_stop(gs, file, direction);
++	}
++	mutex_lock(&gs->pump_lock);
++	for (direction = GEMSLOT_STREAM_RX;
++	     direction <= GEMSLOT_STREAM_TX; direction++) {
++		if (gs->direct[direction].owner == file)
++			gs->direct[direction].owner = NULL;
++	}
++	mutex_unlock(&gs->pump_lock);
++	return 0;
++}
++
++static int gemslot_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	struct gemslot_dev *gs = gemslot_of_file(file);
++	unsigned long size = vma->vm_end - vma->vm_start;
++
++	if (vma->vm_pgoff)
++		return -EINVAL;
++	if (size > gs->pool_size)
++		return -EINVAL;
++
++	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++
++	return remap_pfn_range(vma, vma->vm_start,
++			       PHYS_PFN(gs->pool_phys), size,
++			       vma->vm_page_prot);
++}
++
++static const struct file_operations gemslot_fops = {
++	.owner		= THIS_MODULE,
++	.unlocked_ioctl	= gemslot_ioctl,
++	.release	= gemslot_release,
++	.compat_ioctl	= compat_ptr_ioctl,
++	.mmap		= gemslot_mmap,
++	.llseek		= no_llseek,
++};
++
++/*
++ * Bring-up counters. rx_oversize is the one to read first if jumbo receive is
++ * in doubt: a part that does not implement it decodes the frame length too
++ * long, and every such frame lands here.
++ */
++static int gemslot_stats_show(struct seq_file *m, void *unused)
++{
++	struct gemslot_dev *gs = m->private;
++	unsigned long flags;
++	u32 comp, steer, free;
++
++	spin_lock_irqsave(&gs->tx_lock, flags);
++	comp = gemslot_ring_count(&gs->tx_comp);
++	spin_unlock_irqrestore(&gs->tx_lock, flags);
++
++	spin_lock_irqsave(&gs->rx_lock, flags);
++	steer = gemslot_ring_count(&gs->rx_steer);
++	free = gemslot_ring_count(&gs->rx_free);
++	spin_unlock_irqrestore(&gs->rx_lock, flags);
++
++	seq_printf(m, "tx_frames      %llu\n", gs->tx_frames);
++	seq_printf(m, "rx_steered     %llu\n", gs->rx_steered);
++	seq_printf(m, "rx_copied      %llu\n", gs->rx_copied);
++	seq_printf(m, "rx_starved     %llu\n", gs->rx_starved);
++	seq_printf(m, "rx_oversize    %llu\n", gs->rx_oversize);
++	seq_printf(m, "irq_total      %u\n", READ_ONCE(gs->irq_total));
++	seq_printf(m, "irq_rcomp      %u\n", READ_ONCE(gs->irq_rcomp));
++	seq_printf(m, "irq_tcomp      %u\n", READ_ONCE(gs->irq_tcomp));
++	seq_printf(m, "irq_txubr      %u\n", READ_ONCE(gs->irq_txubr));
++	seq_printf(m, "irq_rxubr      %u\n", READ_ONCE(gs->irq_rxubr));
++	seq_printf(m, "irq_rovr       %u\n", READ_ONCE(gs->irq_rovr));
++	seq_printf(m, "irq_txerr      %u\n", READ_ONCE(gs->irq_txerr));
++	seq_printf(m, "rx_poll_calls  %llu\n", gs->rx_poll_calls);
++	seq_printf(m, "rx_poll_budget %llu\n", gs->rx_poll_budget);
++	seq_printf(m, "rx_poll_max_work %u\n", gs->rx_poll_max_work);
++	seq_printf(m, "rx_poll_max_ns %llu\n", gs->rx_poll_max_ns);
++	seq_printf(m, "rx_poll_busy_gap_max_ns %llu\n",
++		   gs->rx_poll_busy_gap_max_ns);
++	seq_printf(m, "rx_desc_ready_min %u\n", gs->rx_desc_ready_min);
++	seq_printf(m, "rx_desc_ready_seen %u\n", gs->rx_desc_ready_seen);
++	seq_printf(m, "rx_overrun_seen %u\n", gs->rx_overrun_seen);
++	seq_printf(m, "rx_overrun_from_poll %u\n",
++		   gs->rx_overrun_from_poll);
++	seq_printf(m, "rx_overrun_isr 0x%08x\n", gs->rx_overrun_isr);
++	seq_printf(m, "rx_overrun_rsr 0x%08x\n", gs->rx_overrun_rsr);
++	seq_printf(m, "rx_overrun_desc_ready %u\n",
++		   gs->rx_overrun_desc_ready);
++	seq_printf(m, "rx_overrun_used_count %u\n",
++		   gs->rx_overrun_used_count);
++	seq_printf(m, "rx_overrun_dma_ready %u\n",
++		   gs->rx_overrun_dma_ready);
++	seq_printf(m, "rx_overrun_used_prefix %u\n",
++		   gs->rx_overrun_used_prefix);
++	seq_printf(m, "rx_overrun_poll_age_ns %llu\n",
++		   gs->rx_overrun_poll_age_ns);
++	seq_printf(m, "rx_overrun_ddrc_mode_sts 0x%08x\n",
++		   gs->rx_overrun_ddrc_mode_sts);
++	seq_printf(m, "rx_ring_size   %u\n", gs->bp->rx_ring_size);
++	seq_printf(m, "dma_config     0x%08x\n", gem_readl(gs->bp, DMACFG));
++	seq_printf(m, "tx_irq_polling %u\n", READ_ONCE(gs->tx_irq_polling));
++	seq_printf(m, "tx_completions %u\n", comp);
++	seq_printf(m, "fast_tx        %u\n", READ_ONCE(macb_gemslot_fast_tx));
++	seq_printf(m, "rx_steer_queue %u\n", steer);
++	seq_printf(m, "rx_free_slots  %u\n", free);
++	seq_printf(m, "rx_buffer_size %zu\n", gs->bp->rx_buffer_size);
++	seq_printf(m, "mtu            %u\n", gs->bp->dev->mtu);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(gemslot_stats);
++
++static void gemslot_pump_init(struct gemslot_dev *gs)
++{
++	struct device_node *np;
++	struct resource res;
++	int err;
++
++	np = of_find_compatible_node(NULL, NULL, "plutosky,stream-csr");
++	if (!np)
++		return;
++	err = of_address_to_resource(np, 0, &res);
++	if (!err)
++		gs->csr = of_iomap(np, 0);
++	of_node_put(np);
++	if (err || !gs->csr)
++		return;
++	gs->csr_phys = res.start;
++	gs->csr_size = resource_size(&res);
++	if (gs->csr_phys > U32_MAX || gs->csr_size < sizeof(u32))
++		goto unmap;
++
++	gs->pump_task = kthread_run(gemslot_pump_thread, gs, "gemslot-pump");
++	if (IS_ERR(gs->pump_task)) {
++		gs->pump_task = NULL;
++		goto unmap;
++	}
++	np = of_find_compatible_node(NULL, NULL, "plutosky,stream-irq");
++	if (!np)
++		return;
++	gs->pump_irq = irq_of_parse_and_map(np, 0);
++	of_node_put(np);
++	if (gs->pump_irq <= 0) {
++		gs->pump_irq = -1;
++		return;
++	}
++	err = request_irq(gs->pump_irq, gemslot_pump_interrupt, 0,
++			  "gemslot-pump", gs);
++	if (!err)
++		return;
++	irq_dispose_mapping(gs->pump_irq);
++	gs->pump_irq = -1;
++	return;
++unmap:
++	iounmap(gs->csr);
++	gs->csr = NULL;
++}
++
++int macb_gemslot_probe(struct macb *bp)
++{
++	struct device *dev = &bp->pdev->dev;
++	struct device_node *np;
++	struct gemslot_dev *gs;
++	struct resource res;
++	size_t need;
++	int err;
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!np)
++		return 0;
++
++	err = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (err) {
++		dev_err(dev, "gemslot: memory-region has no address\n");
++		return err;
++	}
++
++	/* Slot indices are 16 bits and GEMSLOT_NO_SLOT takes the top value. */
++	if (!gemslot_slots || gemslot_slots >= GEMSLOT_NO_SLOT) {
++		dev_err(dev, "gemslot: slots must be between 1 and %u\n",
++			GEMSLOT_NO_SLOT - 1);
++		return -EINVAL;
++	}
++
++	gs = devm_kzalloc(dev, sizeof(*gs), GFP_KERNEL);
++	if (!gs)
++		return -ENOMEM;
++
++	gs->bp = bp;
++	gs->ddrc_mode_sts = devm_ioremap(dev, GEMSLOT_DDRC_MODE_STS_PHYS,
++					 sizeof(u32));
++	if (!gs->ddrc_mode_sts)
++		return -ENOMEM;
++	gs->pool_phys = res.start;
++	gs->pool_size = resource_size(&res);
++	gs->slot_size = GEMSLOT_SLOT_SIZE;
++	gs->slot_count = gemslot_slots;
++	gs->tx_offset = 0;
++	gs->rx_offset = gs->slot_count * gs->slot_size;
++
++	need = (size_t)gs->slot_count * gs->slot_size * 2;
++	if (need > gs->pool_size) {
++		dev_err(dev, "gemslot: pool of %zu bytes is short of the %zu two rings need\n",
++			gs->pool_size, need);
++		return -EINVAL;
++	}
++
++	/* The region is no-map, so nothing else holds a cacheable alias and a
++	 * write-combining mapping needs no cache maintenance against the DMA.
++	 */
++	gs->pool = devm_memremap(dev, gs->pool_phys, gs->pool_size, MEMREMAP_WC);
++	if (IS_ERR(gs->pool))
++		return PTR_ERR(gs->pool);
++
++	gs->tx_comp_buf = devm_kcalloc(dev, GEMSLOT_COMP_RING,
++				       sizeof(*gs->tx_comp_buf), GFP_KERNEL);
++	gs->rx_steer_buf = devm_kcalloc(dev, GEMSLOT_STEER_RING,
++					sizeof(*gs->rx_steer_buf), GFP_KERNEL);
++	gs->rx_free_buf = devm_kcalloc(dev, GEMSLOT_FREE_RING,
++				       sizeof(*gs->rx_free_buf), GFP_KERNEL);
++	gs->portmap = devm_kzalloc(dev, GEMSLOT_PORTMAP_BYTES, GFP_KERNEL);
++	gs->rx_outstanding = devm_kzalloc(dev, BITS_TO_BYTES(gs->slot_count),
++					  GFP_KERNEL);
++	if (!gs->tx_comp_buf || !gs->rx_steer_buf || !gs->rx_free_buf ||
++	    !gs->portmap || !gs->rx_outstanding)
++		return -ENOMEM;
++
++	spin_lock_init(&gs->tx_lock);
++	spin_lock_init(&gs->rx_lock);
++	init_waitqueue_head(&gs->wq);
++	init_waitqueue_head(&gs->pump_wq);
++	mutex_init(&gs->pump_lock);
++	atomic_set(&gs->pump_event, 0);
++	atomic_set(&gs->pump_irq_masked, 0);
++	gs->pump_irq = -1;
++	gemslot_ring_init(&gs->tx_comp, GEMSLOT_COMP_RING);
++
++	gs->misc.minor = MISC_DYNAMIC_MINOR;
++	gs->misc.name = "gemslot0";
++	gs->misc.fops = &gemslot_fops;
++	gs->misc.parent = dev;
++
++	bp->gemslot = gs;
++	macb_gemslot_init_pool(bp);
++	gemslot_pump_init(gs);
++
++	err = misc_register(&gs->misc);
++	if (err) {
++		dev_err(dev, "gemslot: cannot register /dev/gemslot0\n");
++		macb_gemslot_remove(bp);
++		return err;
++	}
++	gs->registered = true;
++
++	gs->debugfs = debugfs_create_dir("gemslot0", NULL);
++	debugfs_create_file("stats", 0444, gs->debugfs, gs, &gemslot_stats_fops);
++
++	dev_info(dev, "gemslot: %u slots of %u bytes per ring at %pa, tx +0x%x rx +0x%x\n",
++		 gs->slot_count, gs->slot_size, &gs->pool_phys,
++		 gs->tx_offset, gs->rx_offset);
++
++	return 0;
++}
++
++void macb_gemslot_remove(struct macb *bp)
++{
++	struct gemslot_dev *gs = bp->gemslot;
++
++	if (!gs)
++		return;
++	if (gs->pump_irq > 0) {
++		free_irq(gs->pump_irq, gs);
++		irq_dispose_mapping(gs->pump_irq);
++	}
++	if (gs->pump_task)
++		kthread_stop(gs->pump_task);
++	if (gs->csr)
++		iounmap(gs->csr);
++
++	debugfs_remove_recursive(gs->debugfs);
++	if (gs->registered)
++		misc_deregister(&gs->misc);
++	bp->gemslot = NULL;
++}
+diff --git a/drivers/net/ethernet/cadence/macb_gemslot.h b/drivers/net/ethernet/cadence/macb_gemslot.h
+new file mode 100644
+index 000000000..8a4fb2895
+--- /dev/null
++++ b/drivers/net/ethernet/cadence/macb_gemslot.h
+@@ -0,0 +1,182 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * GEM slot fast path: a reserved-memory slot pool that the PL fills and drains,
++ * configured from user space through /dev/gemslot0 instead of through the
++ * socket layer. Normal networking keeps running on the same interface.
++ */
++#ifndef _MACB_GEMSLOT_H
++#define _MACB_GEMSLOT_H
++
++#include <linux/atomic.h>
++#include <linux/io.h>
++#include <linux/miscdevice.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <uapi/linux/gemslot.h>
++
++#include "macb_gemslot_lib.h"
++
++#define GEMSLOT_SLOT_SIZE	9728
++#define GEMSLOT_SLOT_COUNT	2048
++
++/* Marks a receive ring entry that holds no slot. */
++#define GEMSLOT_NO_SLOT		0xffffu
++
++/* Completion and steer rings hold at most one entry per slot. */
++#define GEMSLOT_COMP_RING	4096
++#define GEMSLOT_STEER_RING	4096
++#define GEMSLOT_FREE_RING	4096
++
++/* Largest jumbo MTU the fast path offers, and the frame it implies. */
++#define GEMSLOT_JUMBO_MTU	9000
++#define GEMSLOT_JUMBO_FRAME_LEN	(GEMSLOT_JUMBO_MTU + ETH_HLEN + ETH_FCS_LEN)
++
++/* Receive buffer size the fallback programs when jumbo receive is off. */
++#define GEMSLOT_SMALL_RX_BUF	1536
++
++struct macb;
++struct macb_queue;
++struct task_struct;
++
++struct gemslot_direct_stream {
++	struct file		*owner;
++	struct gemslot_stream_config config;
++	bool			active;
++	bool			stopping;
++	u32			base;
++	u32			last_produced;
++	u32			queued;
++	u32			released;
++	u32			inflight_head;
++	u32			inflight_tail;
++	u16			inflight[GEMSLOT_BATCH_MAX];
++	u64			end_ticks[GEMSLOT_BATCH_MAX];
++	u64			produced;
++	u64			submitted;
++	u64			completed;
++	u64			consumed_ticks;
++	u64			dropped;
++};
++
++struct gemslot_dev {
++	struct macb		*bp;
++	struct miscdevice	misc;
++	struct dentry		*debugfs;
++	bool			registered;
++
++	phys_addr_t		pool_phys;
++	size_t			pool_size;
++	void			*pool;
++
++	u32			slot_size;
++	u32			slot_count;
++	u32			tx_offset;
++	u32			rx_offset;
++
++	/* Completions, filled by the transmit interrupt. */
++	spinlock_t		tx_lock;
++	struct gemslot_ring	tx_comp;
++	struct gemslot_tx_entry	*tx_comp_buf;
++
++	/* Steered frames and free receive slots, both touched from NAPI. */
++	spinlock_t		rx_lock;
++	struct gemslot_ring	rx_steer;
++	struct gemslot_rx_entry	*rx_steer_buf;
++	struct gemslot_ring	rx_free;
++	u16			*rx_free_buf;
++
++	u8			*portmap;
++	/* One bit per receive slot the daemon is holding, so a slot returned
++	 * twice is refused instead of landing in the free list twice.
++	 */
++	u8			*rx_outstanding;
++
++	wait_queue_head_t	wq;
++	struct mutex		pump_lock;
++	wait_queue_head_t	pump_wq;
++	struct task_struct	*pump_task;
++	struct gemslot_direct_stream direct[2];
++	bool			tx_irq_polling;
++	void __iomem		*csr;
++	void __iomem		*ddrc_mode_sts;
++	phys_addr_t		csr_phys;
++	u32			csr_size;
++	int			pump_irq;
++	atomic_t		pump_irq_masked;
++	atomic_t		pump_event;
++
++	u64			tx_frames;
++	u64			rx_steered;
++	u64			rx_copied;
++	u64			rx_starved;
++	u64			rx_oversize;
++	u32			irq_total;
++	u32			irq_rcomp;
++	u32			irq_tcomp;
++	u32			irq_txubr;
++	u32			irq_rxubr;
++	u32			irq_rovr;
++	u32			irq_txerr;
++	u64			rx_poll_calls;
++	u64			rx_poll_budget;
++	u32			rx_poll_max_work;
++	u64			rx_poll_max_ns;
++	u64			rx_poll_busy_gap_max_ns;
++	u64			rx_poll_end_ns;
++	bool			rx_poll_was_busy;
++	u32			rx_desc_ready_min;
++	bool			rx_desc_ready_seen;
++	bool			rx_overrun_seen;
++	bool			rx_overrun_from_poll;
++	u32			rx_overrun_isr;
++	u32			rx_overrun_rsr;
++	u32			rx_overrun_desc_ready;
++	u32			rx_overrun_used_count;
++	u32			rx_overrun_dma_ready;
++	u32			rx_overrun_used_prefix;
++	u64			rx_overrun_poll_age_ns;
++	u32			rx_overrun_ddrc_mode_sts;
++};
++
++static inline u32 gemslot_ring_base(const struct gemslot_dev *gs, bool tx)
++{
++	return (u32)gs->pool_phys + (tx ? gs->tx_offset : gs->rx_offset);
++}
++
++static inline u32 gemslot_phys(const struct gemslot_dev *gs, bool tx, u16 slot)
++{
++	return gemslot_ring_base(gs, tx) + (u32)slot * gs->slot_size;
++}
++
++static inline void *gemslot_va(const struct gemslot_dev *gs, bool tx, u16 slot)
++{
++	u32 off = (tx ? gs->tx_offset : gs->rx_offset) + (u32)slot * gs->slot_size;
++
++	return (u8 *)gs->pool + off;
++}
++
++extern bool macb_gemslot_jumbo;
++extern bool macb_gemslot_fast_tx;
++
++int macb_gemslot_probe(struct macb *bp);
++void macb_gemslot_remove(struct macb *bp);
++void macb_gemslot_link_down(struct gemslot_dev *gs);
++void macb_gemslot_fault(struct gemslot_dev *gs);
++
++/* Called from the transmit completion path with bp->lock held. */
++void macb_gemslot_tx_done(struct gemslot_dev *gs, u16 slot, u16 len);
++
++/* Receive slot allocation and return, called from NAPI and from the ioctl. */
++int macb_gemslot_take_slot(struct gemslot_dev *gs);
++void macb_gemslot_put_slot(struct gemslot_dev *gs, u16 slot);
++int macb_gemslot_return_slot(struct gemslot_dev *gs, u16 slot);
++void macb_gemslot_deliver(struct gemslot_dev *gs, u16 slot, u16 len);
++void macb_gemslot_wake(struct gemslot_dev *gs);
++
++/* Implemented in macb_main.c, where the descriptor helpers live. */
++int macb_gemslot_submit(struct macb *bp, const struct gemslot_tx_entry *entries,
++			u32 count);
++void macb_gemslot_poll_tx(struct macb *bp, bool direct_rx_active);
++
++#endif /* _MACB_GEMSLOT_H */
+diff --git a/drivers/net/ethernet/cadence/macb_gemslot_lib.h b/drivers/net/ethernet/cadence/macb_gemslot_lib.h
+new file mode 100644
+index 000000000..5adeed31e
+--- /dev/null
++++ b/drivers/net/ethernet/cadence/macb_gemslot_lib.h
+@@ -0,0 +1,147 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Frame classification and slot-ring bookkeeping for the GEM slot fast path.
++ *
++ * Everything here is free of kernel dependencies so the same code that runs in
++ * the receive path can be compiled and tested on the host.
++ */
++#ifndef _MACB_GEMSLOT_LIB_H
++#define _MACB_GEMSLOT_LIB_H
++
++#include <linux/types.h>
++
++/* One bit per UDP destination port. */
++#define GEMSLOT_PORTMAP_BYTES	(65536 / 8)
++
++#define GEMSLOT_ETH_HLEN	14
++#define GEMSLOT_ETHERTYPE_OFF	12
++#define GEMSLOT_ETHERTYPE_IPV4	0x0800
++#define GEMSLOT_ETHERTYPE_VLAN	0x8100
++#define GEMSLOT_VLAN_TAG_LEN	4
++#define GEMSLOT_IPV4_MIN_IHL	5
++#define GEMSLOT_IPPROTO_UDP	17
++#define GEMSLOT_IPV4_FRAG_MASK	0x3fff
++#define GEMSLOT_UDP_HLEN	8
++
++static inline __u16 gemslot_be16(const __u8 *p)
++{
++	return (__u16)(((__u16)p[0] << 8) | p[1]);
++}
++
++static inline int gemslot_bit_test(const __u8 *map, unsigned int n)
++{
++	return (map[n >> 3] >> (n & 7)) & 1;
++}
++
++static inline void gemslot_bit_assign(__u8 *map, unsigned int n, int on)
++{
++	__u8 bit = (__u8)(1u << (n & 7));
++	__u8 v = map[n >> 3];
++
++	map[n >> 3] = on ? (__u8)(v | bit) : (__u8)(v & ~bit);
++}
++
++/*
++ * The UDP destination port of an IPv4 frame, or -1 when the frame is anything
++ * else. Only the first fragment carries a UDP header, so a later fragment is
++ * left for the stack.
++ */
++static inline int gemslot_udp_dport(const __u8 *frame, unsigned int len)
++{
++	unsigned int off = GEMSLOT_ETH_HLEN;
++	unsigned int ihl, udp;
++	__u16 type;
++
++	if (len < GEMSLOT_ETH_HLEN)
++		return -1;
++
++	type = gemslot_be16(frame + GEMSLOT_ETHERTYPE_OFF);
++	if (type == GEMSLOT_ETHERTYPE_VLAN) {
++		if (len < off + GEMSLOT_VLAN_TAG_LEN)
++			return -1;
++		type = gemslot_be16(frame + off + 2);
++		off += GEMSLOT_VLAN_TAG_LEN;
++	}
++	if (type != GEMSLOT_ETHERTYPE_IPV4)
++		return -1;
++
++	if (len < off + 20)
++		return -1;
++	if ((frame[off] >> 4) != 4)
++		return -1;
++
++	ihl = frame[off] & 0x0f;
++	if (ihl < GEMSLOT_IPV4_MIN_IHL)
++		return -1;
++	if (frame[off + 9] != GEMSLOT_IPPROTO_UDP)
++		return -1;
++	if (gemslot_be16(frame + off + 6) & GEMSLOT_IPV4_FRAG_MASK)
++		return -1;
++
++	udp = off + ihl * 4;
++	if (len < udp + GEMSLOT_UDP_HLEN)
++		return -1;
++
++	return gemslot_be16(frame + udp + 2);
++}
++
++static inline int gemslot_steered(const __u8 *map, const __u8 *frame,
++				  unsigned int len)
++{
++	int port = gemslot_udp_dport(frame, len);
++
++	return port >= 0 && gemslot_bit_test(map, (unsigned int)port);
++}
++
++/*
++ * Index ring over a power-of-two array. One producer and one consumer, and the
++ * caller serializes them.
++ */
++struct gemslot_ring {
++	__u32 head;
++	__u32 tail;
++	__u32 mask;
++};
++
++static inline void gemslot_ring_init(struct gemslot_ring *r, __u32 capacity)
++{
++	r->head = 0;
++	r->tail = 0;
++	r->mask = capacity - 1;
++}
++
++static inline __u32 gemslot_ring_count(const struct gemslot_ring *r)
++{
++	return (r->head - r->tail) & r->mask;
++}
++
++static inline __u32 gemslot_ring_space(const struct gemslot_ring *r)
++{
++	return r->mask - gemslot_ring_count(r);
++}
++
++/* The array index to write, or -1 when the ring is full. */
++static inline int gemslot_ring_push(struct gemslot_ring *r)
++{
++	__u32 next = (r->head + 1) & r->mask;
++
++	if (next == r->tail)
++		return -1;
++
++	r->head = next;
++	return (int)((next - 1) & r->mask);
++}
++
++/* The array index to read, or -1 when the ring is empty. */
++static inline int gemslot_ring_pop(struct gemslot_ring *r)
++{
++	__u32 tail = r->tail;
++
++	if (tail == r->head)
++		return -1;
++
++	r->tail = (tail + 1) & r->mask;
++	return (int)tail;
++}
++
++#endif /* _MACB_GEMSLOT_LIB_H */
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+index a90fdc77f..a8ff9b6ae 100644
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
+ #include <linux/types.h>
+ #include <linux/circ_buf.h>
+ #include <linux/slab.h>
+@@ -42,6 +43,7 @@
+ #include <linux/firmware/xlnx-zynqmp.h>
+ #include <linux/ptp_classify.h>
+ #include "macb.h"
++#include "macb_gemslot.h"
+ 
+ /* This structure is only used for MACB on SiFive FU540 devices */
+ struct sifive_fu540_macb_mgmt {
+@@ -74,6 +76,7 @@ struct sifive_fu540_macb_mgmt {
+ 					| MACB_BIT(TXERR))
+ #define MACB_TX_INT_FLAGS	(MACB_TX_ERR_FLAGS | MACB_BIT(TCOMP)	\
+ 					| MACB_BIT(TXUBR))
++#define GEMSLOT_TX_POLL_IRQS	(MACB_BIT(TCOMP) | MACB_BIT(TXUBR))
+ 
+ /* Max length of transmit frame must be a multiple of 8 bytes */
+ #define MACB_TX_LEN_ALIGN	8
+@@ -1049,6 +1052,14 @@ static int macb_halt_tx(struct macb *bp)
+ 
+ static void macb_tx_unmap(struct macb *bp, struct macb_tx_skb *tx_skb)
+ {
++	if (tx_skb->slot) {
++		macb_gemslot_tx_done(bp->gemslot, tx_skb->slot_index,
++				     (u16)tx_skb->size);
++		tx_skb->slot = false;
++		tx_skb->size = 0;
++		return;
++	}
++
+ 	if (tx_skb->mapping) {
+ 		if (tx_skb->mapped_as_page)
+ 			dma_unmap_page(&bp->pdev->dev, tx_skb->mapping,
+@@ -1065,6 +1076,22 @@ static void macb_tx_unmap(struct macb *bp, struct macb_tx_skb *tx_skb)
+ 	}
+ }
+ 
++static void macb_gemslot_cancel_tx(struct macb *bp)
++{
++	struct macb_queue *queue;
++	unsigned int tail;
++
++	if (!bp->gemslot)
++		return;
++	queue = &bp->queues[0];
++	for (tail = queue->tx_tail; tail != queue->tx_head; tail++) {
++		struct macb_tx_skb *tx_skb = macb_tx_skb(queue, tail);
++
++		if (tx_skb->slot)
++			macb_tx_unmap(bp, tx_skb);
++	}
++}
++
+ static void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_t addr)
+ {
+ #ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+@@ -1148,7 +1175,7 @@ static void macb_tx_error_task(struct work_struct *work)
+ 
+ 		if (ctrl & MACB_BIT(TX_USED)) {
+ 			/* skb is set for the last buffer of the frame */
+-			while (!skb) {
++			while (!skb && !tx_skb->slot) {
+ 				macb_tx_unmap(bp, tx_skb);
+ 				tail++;
+ 				tx_skb = macb_tx_skb(queue, tail);
+@@ -1159,13 +1186,12 @@ static void macb_tx_error_task(struct work_struct *work)
+ 			 * since it's the only one written back by the hardware
+ 			 */
+ 			if (!(ctrl & MACB_BIT(TX_BUF_EXHAUSTED))) {
+-				netdev_vdbg(bp->dev, "txerr skb %u (data %p) TX complete\n",
+-					    macb_tx_ring_wrap(bp, tail),
+-					    skb->data);
++				netdev_vdbg(bp->dev, "txerr skb %u TX complete\n",
++					    macb_tx_ring_wrap(bp, tail));
+ 				bp->dev->stats.tx_packets++;
+ 				queue->stats.tx_packets++;
+-				bp->dev->stats.tx_bytes += skb->len;
+-				queue->stats.tx_bytes += skb->len;
++				bp->dev->stats.tx_bytes += skb ? skb->len : tx_skb->size;
++				queue->stats.tx_bytes += skb ? skb->len : tx_skb->size;
+ 			}
+ 		} else {
+ 			/* "Buffers exhausted mid-frame" errors may only happen
+@@ -1202,7 +1228,9 @@ static void macb_tx_error_task(struct work_struct *work)
+ 
+ 	/* Housework before enabling TX IRQ */
+ 	macb_writel(bp, TSR, macb_readl(bp, TSR));
+-	queue_writel(queue, IER, MACB_TX_INT_FLAGS);
++	queue_writel(queue, IER, MACB_TX_INT_FLAGS &
++		      ~(bp->gemslot && queue == bp->queues &&
++			bp->gemslot->tx_irq_polling ? GEMSLOT_TX_POLL_IRQS : 0));
+ 
+ 	if (halt_timeout)
+ 		macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TE));
+@@ -1285,6 +1313,14 @@ static void macb_tx_interrupt(struct macb_queue *queue)
+ 		for (;; tail++) {
+ 			tx_skb = macb_tx_skb(queue, tail);
+ 			skb = tx_skb->skb;
++			if (tx_skb->slot) {
++				bp->dev->stats.tx_packets++;
++				queue->stats.tx_packets++;
++				bp->dev->stats.tx_bytes += tx_skb->size;
++				queue->stats.tx_bytes += tx_skb->size;
++				macb_tx_unmap(bp, tx_skb);
++				break;
++			}
+ 
+ 			/* First, update TX stats if needed */
+ 			if (skb) {
+@@ -1325,6 +1361,39 @@ static void macb_tx_interrupt(struct macb_queue *queue)
+ 		netif_wake_subqueue(bp->dev, queue_index);
+ }
+ 
++void macb_gemslot_poll_tx(struct macb *bp, bool direct_rx_active)
++{
++	struct gemslot_dev *gs = bp->gemslot;
++	struct macb_queue *queue = &bp->queues[0];
++	unsigned long flags;
++
++	if (!gs)
++		return;
++	spin_lock_irqsave(&bp->lock, flags);
++	if (!netif_running(bp->dev)) {
++		gs->tx_irq_polling = false;
++		goto out;
++	}
++	if (direct_rx_active) {
++		/* Direct RX uses the pump for both TX completion causes. */
++		queue_writel(queue, IDR, GEMSLOT_TX_POLL_IRQS);
++		gs->tx_irq_polling = true;
++	}
++	if (gs->tx_irq_polling && queue->tx_tail != queue->tx_head) {
++		struct macb_dma_desc *desc = macb_tx_desc(queue, queue->tx_tail);
++
++		rmb();
++		if (desc->ctrl & MACB_BIT(TX_USED))
++			macb_tx_interrupt(queue);
++	}
++	if (!direct_rx_active && gs->tx_irq_polling) {
++		queue_writel(queue, IER, GEMSLOT_TX_POLL_IRQS);
++		gs->tx_irq_polling = false;
++	}
++out:
++	spin_unlock_irqrestore(&bp->lock, flags);
++}
++
+ static void gem_rx_refill(struct macb_queue *queue)
+ {
+ 	unsigned int		entry;
+@@ -1341,6 +1410,24 @@ static void gem_rx_refill(struct macb_queue *queue)
+ 		rmb();
+ 
+ 		desc = macb_rx_desc(queue, entry);
++		if (bp->gemslot) {
++			if (queue->rx_slot[entry] == GEMSLOT_NO_SLOT) {
++				int slot = macb_gemslot_take_slot(bp->gemslot);
++
++				if (slot < 0)
++					break;
++				queue->rx_slot[entry] = (u16)slot;
++			}
++			paddr = gemslot_phys(bp->gemslot, false,
++					     queue->rx_slot[entry]);
++			if (entry == bp->rx_ring_size - 1)
++				paddr |= MACB_BIT(RX_WRAP);
++			desc->ctrl = 0;
++			dma_wmb();
++			macb_set_addr(bp, desc, paddr);
++			queue->rx_prepared_head++;
++			continue;
++		}
+ 
+ 		if (!queue->rx_skbuff[entry]) {
+ 			/* allocate sk_buff for this free entry in ring */
+@@ -1422,10 +1509,13 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
+ 		  int budget)
+ {
+ 	struct macb *bp = queue->bp;
++	struct gemslot_dev *gs = bp->gemslot;
++	u64 poll_start_ns = gs ? ktime_get_ns() : 0;
+ 	unsigned int		len;
+ 	unsigned int		entry;
+ 	struct sk_buff		*skb;
+ 	struct macb_dma_desc	*desc;
++	bool			steered = false;
+ 	int			count = 0;
+ 
+ 	while (count < budget) {
+@@ -1460,23 +1550,76 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
+ 			queue->stats.rx_dropped++;
+ 			break;
+ 		}
+-		skb = queue->rx_skbuff[entry];
+-		if (unlikely(!skb)) {
+-			netdev_err(bp->dev,
+-				   "inconsistent Rx descriptor chain\n");
+-			bp->dev->stats.rx_dropped++;
+-			queue->stats.rx_dropped++;
+-			break;
+-		}
+-		/* now everything is ready for receiving packet */
+-		queue->rx_skbuff[entry] = NULL;
+ 		len = ctrl & bp->rx_frm_len_mask;
+ 
+ 		netdev_vdbg(bp->dev, "gem_rx %u (len %u)\n", entry, len);
+ 
+-		skb_put(skb, len);
+-		dma_unmap_single(&bp->pdev->dev, addr,
+-				 bp->rx_buffer_size, DMA_FROM_DEVICE);
++		if (bp->gemslot) {
++			struct gemslot_dev *gs = bp->gemslot;
++			u16 slot = queue->rx_slot[entry];
++			void *frame;
++
++			if (unlikely(slot == GEMSLOT_NO_SLOT)) {
++				bp->dev->stats.rx_dropped++;
++				queue->stats.rx_dropped++;
++				break;
++			}
++			frame = (u8 *)gemslot_va(gs, false, slot) +
++				GEMSLOT_FRAME_OFFSET;
++			if (unlikely(len > bp->rx_buffer_size -
++					   GEMSLOT_FRAME_OFFSET ||
++				     len > gs->slot_size - GEMSLOT_FRAME_OFFSET)) {
++				gs->rx_oversize++;
++				bp->dev->stats.rx_dropped++;
++				queue->stats.rx_dropped++;
++				continue;
++			}
++			if (gemslot_steered(gs->portmap, frame, len)) {
++				int replacement = macb_gemslot_take_slot(gs);
++
++				if (replacement < 0) {
++					bp->dev->stats.rx_dropped++;
++					queue->stats.rx_dropped++;
++					continue;
++				}
++				queue->rx_slot[entry] = (u16)replacement;
++				macb_gemslot_deliver(gs, slot, (u16)len);
++				bp->dev->stats.rx_packets++;
++				queue->stats.rx_packets++;
++				bp->dev->stats.rx_bytes += len;
++				queue->stats.rx_bytes += len;
++				steered = true;
++				continue;
++			}
++			skb = netdev_alloc_skb(bp->dev, bp->rx_buffer_size);
++			if (unlikely(!skb)) {
++				bp->dev->stats.rx_dropped++;
++				queue->stats.rx_dropped++;
++				continue;
++			}
++			skb_reserve(skb, NET_IP_ALIGN);
++			memcpy(skb_put(skb, len), frame, len);
++			gs->rx_copied++;
++		} else {
++			skb = queue->rx_skbuff[entry];
++			if (unlikely(!skb)) {
++				netdev_err(bp->dev,
++					   "inconsistent Rx descriptor chain\n");
++				bp->dev->stats.rx_dropped++;
++				queue->stats.rx_dropped++;
++				break;
++			}
++			queue->rx_skbuff[entry] = NULL;
++			dma_unmap_single(&bp->pdev->dev, addr,
++					 bp->rx_buffer_size, DMA_FROM_DEVICE);
++			if (unlikely(len > bp->rx_buffer_size - NET_IP_ALIGN)) {
++				bp->dev->stats.rx_dropped++;
++				queue->stats.rx_dropped++;
++				dev_kfree_skb_any(skb);
++				continue;
++			}
++			skb_put(skb, len);
++		}
+ 
+ 		skb->protocol = eth_type_trans(skb, bp->dev);
+ 
+@@ -1515,10 +1658,140 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
+ 	}
+ 
+ 	gem_rx_refill(queue);
++	if (steered)
++		macb_gemslot_wake(bp->gemslot);
++	if (gs) {
++		u64 poll_end_ns = ktime_get_ns();
++		u64 elapsed_ns = poll_end_ns - poll_start_ns;
++		u32 ready = queue->rx_prepared_head - queue->rx_tail;
++
++		gs->rx_poll_calls++;
++		if (count == budget)
++			gs->rx_poll_budget++;
++		if (count > gs->rx_poll_max_work)
++			gs->rx_poll_max_work = count;
++		if (elapsed_ns > gs->rx_poll_max_ns)
++			gs->rx_poll_max_ns = elapsed_ns;
++		if (gs->rx_poll_was_busy &&
++		    poll_start_ns - gs->rx_poll_end_ns >
++		    gs->rx_poll_busy_gap_max_ns)
++			gs->rx_poll_busy_gap_max_ns =
++				poll_start_ns - gs->rx_poll_end_ns;
++		gs->rx_poll_was_busy = count == budget;
++		gs->rx_poll_end_ns = poll_end_ns;
++		if (count && (!gs->rx_desc_ready_seen ||
++			      ready < gs->rx_desc_ready_min)) {
++			gs->rx_desc_ready_min = ready;
++			gs->rx_desc_ready_seen = true;
++		}
++	}
+ 
+ 	return count;
+ }
+ 
++#define GEMSLOT_TX_NETWORK_RESERVE 64
++
++static int macb_gemslot_submit_direct(struct macb *bp,
++				     const struct gemslot_tx_entry *entries, u32 count)
++{
++	struct macb_queue *queue = &bp->queues[0];
++	struct gemslot_dev *gs = bp->gemslot;
++	struct macb_dma_desc *desc;
++	struct macb_tx_skb *tx_skb;
++	unsigned int head, entry, space;
++	unsigned long flags;
++	u32 accepted, i, ctrl;
++
++	spin_lock_irqsave(&bp->lock, flags);
++	if (!netif_running(bp->dev) || !netif_carrier_ok(bp->dev)) {
++		spin_unlock_irqrestore(&bp->lock, flags);
++		return -ENETDOWN;
++	}
++
++	space = CIRC_SPACE(queue->tx_head, queue->tx_tail, bp->tx_ring_size);
++	/* Keep descriptors available for SSH and ordinary network traffic. */
++	accepted = min_t(u32, count,
++			 space > GEMSLOT_TX_NETWORK_RESERVE ?
++			 space - GEMSLOT_TX_NETWORK_RESERVE : 0);
++	if (!accepted) {
++		spin_unlock_irqrestore(&bp->lock, flags);
++		return 0;
++	}
++
++	head = queue->tx_head;
++	for (i = 0; i < accepted; i++) {
++		entry = macb_tx_ring_wrap(bp, head + i);
++		tx_skb = &queue->tx_skb[entry];
++		tx_skb->skb = NULL;
++		tx_skb->mapping = 0;
++		tx_skb->mapped_as_page = false;
++		tx_skb->size = entries[i].len;
++		tx_skb->slot = true;
++		tx_skb->slot_index = entries[i].slot;
++	}
++
++	entry = macb_tx_ring_wrap(bp, head + accepted);
++	desc = macb_tx_desc(queue, entry);
++	ctrl = MACB_BIT(TX_USED);
++	if (entry == bp->tx_ring_size - 1)
++		ctrl |= MACB_BIT(TX_WRAP);
++	desc->ctrl = ctrl;
++
++	i = accepted;
++	while (i--) {
++		entry = macb_tx_ring_wrap(bp, head + i);
++		desc = macb_tx_desc(queue, entry);
++		ctrl = (u32)entries[i].len | MACB_BIT(TX_LAST);
++		if (entry == bp->tx_ring_size - 1)
++			ctrl |= MACB_BIT(TX_WRAP);
++		macb_set_addr(bp, desc,
++			      gemslot_phys(gs, true, entries[i].slot) +
++			      GEMSLOT_FRAME_OFFSET);
++		wmb();
++		desc->ctrl = ctrl;
++	}
++
++	queue->tx_head = head + accepted;
++	wmb();
++	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
++	spin_unlock_irqrestore(&bp->lock, flags);
++	return accepted;
++}
++
++int macb_gemslot_submit(struct macb *bp, const struct gemslot_tx_entry *entries,
++			u32 count)
++{
++	struct gemslot_dev *gs = bp->gemslot;
++	u32 accepted;
++
++	if (!gs)
++		return -ENODEV;
++	if (!netif_running(bp->dev))
++		return -ENETDOWN;
++	if (READ_ONCE(macb_gemslot_fast_tx) ||
++	    READ_ONCE(gs->direct[GEMSLOT_STREAM_RX].active))
++		return macb_gemslot_submit_direct(bp, entries, count);
++
++	for (accepted = 0; accepted < count; accepted++) {
++		const struct gemslot_tx_entry *entry = &entries[accepted];
++		const void *frame = (u8 *)gemslot_va(gs, true, entry->slot) +
++				    GEMSLOT_FRAME_OFFSET;
++		struct sk_buff *skb;
++
++		skb = netdev_alloc_skb_ip_align(bp->dev, entry->len);
++		if (!skb)
++			return accepted ? (int)accepted : -ENOMEM;
++
++		memcpy(skb_put(skb, entry->len), frame, entry->len);
++		skb_reset_mac_header(skb);
++		skb->protocol = ((struct ethhdr *)skb->data)->h_proto;
++		dev_queue_xmit(skb);
++		macb_gemslot_tx_done(gs, entry->slot, entry->len);
++	}
++
++	return accepted;
++}
++
+ static int macb_rx_frame(struct macb_queue *queue, struct napi_struct *napi,
+ 			 unsigned int first_frag, unsigned int last_frag)
+ {
+@@ -1711,6 +1984,43 @@ static int macb_rx(struct macb_queue *queue, struct napi_struct *napi,
+ 	return received;
+ }
+ 
++static void gem_rx_overrun_snapshot(struct macb_queue *queue, u32 irq_status,
++				    u32 rx_status, bool from_poll)
++{
++	struct gemslot_dev *gs = queue->bp->gemslot;
++	unsigned int i;
++	u32 prefix = 0;
++	u32 used = 0;
++	u32 posted;
++
++	if (!gs || queue != queue->bp->queues || gs->rx_overrun_seen)
++		return;
++
++	gs->rx_overrun_from_poll = from_poll;
++	gs->rx_overrun_isr = irq_status;
++	gs->rx_overrun_rsr = rx_status;
++	posted = queue->rx_prepared_head - queue->rx_tail;
++	gs->rx_overrun_desc_ready = posted;
++	for (i = 0; i < posted; i++) {
++		struct macb_dma_desc *desc =
++			macb_rx_desc(queue, queue->rx_tail + i);
++
++		if (READ_ONCE(desc->addr) & MACB_BIT(RX_USED)) {
++			used++;
++			if (prefix == i)
++				prefix++;
++		}
++	}
++	gs->rx_overrun_used_count = used;
++	gs->rx_overrun_dma_ready = posted - used;
++	gs->rx_overrun_used_prefix = prefix;
++	if (gs->rx_poll_end_ns)
++		gs->rx_overrun_poll_age_ns =
++			ktime_get_ns() - gs->rx_poll_end_ns;
++	gs->rx_overrun_ddrc_mode_sts = readl_relaxed(gs->ddrc_mode_sts);
++	gs->rx_overrun_seen = true;
++}
++
+ static int macb_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct macb_queue *queue = container_of(napi, struct macb_queue, napi);
+@@ -1720,6 +2030,13 @@ static int macb_poll(struct napi_struct *napi, int budget)
+ 
+ 	status = macb_readl(bp, RSR);
+ 	macb_writel(bp, RSR, status);
++	if (unlikely((status & MACB_BIT(OVR)) && bp->gemslot)) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&bp->lock, flags);
++		gem_rx_overrun_snapshot(queue, 0, status, true);
++		spin_unlock_irqrestore(&bp->lock, flags);
++	}
+ 
+ 	netdev_vdbg(bp->dev, "poll: status = %08lx, budget = %d\n",
+ 		    (unsigned long)status, budget);
+@@ -1772,6 +2089,7 @@ static void macb_hresp_error_task(struct tasklet_struct *t)
+ 	struct macb *bp = from_tasklet(bp, t, hresp_err_tasklet);
+ 	struct net_device *dev = bp->dev;
+ 	struct macb_queue *queue;
++	unsigned long flags;
+ 	unsigned int q;
+ 	u32 ctrl;
+ 
+@@ -1786,6 +2104,10 @@ static void macb_hresp_error_task(struct tasklet_struct *t)
+ 
+ 	netif_tx_stop_all_queues(dev);
+ 	netif_carrier_off(dev);
++	macb_gemslot_fault(bp->gemslot);
++	spin_lock_irqsave(&bp->lock, flags);
++	macb_gemslot_cancel_tx(bp);
++	spin_unlock_irqrestore(&bp->lock, flags);
+ 
+ 	bp->macbgem_ops.mog_init_rings(bp);
+ 
+@@ -1826,16 +2148,32 @@ static irqreturn_t macb_interrupt(int irq, void *dev_id)
+ 	struct macb_queue *queue = dev_id;
+ 	struct macb *bp = queue->bp;
+ 	struct net_device *dev = bp->dev;
+-	u32 status, ctrl;
++	u32 status, ctrl, rx_status = 0;
+ 
+ 	status = queue_readl(queue, ISR);
+ 
+ 	if (unlikely(!status))
+ 		return IRQ_NONE;
++	if (unlikely(status & MACB_BIT(ISR_ROVR)) && bp->gemslot)
++		rx_status = macb_readl(bp, RSR);
+ 
+ 	spin_lock(&bp->lock);
+ 
+ 	while (status) {
++		if (bp->gemslot && queue == bp->queues) {
++			struct gemslot_dev *gs = bp->gemslot;
++
++			gs->irq_total++;
++			gs->irq_rcomp += !!(status & MACB_BIT(RCOMP));
++			gs->irq_tcomp += !!(status & MACB_BIT(TCOMP));
++			gs->irq_txubr += !!(status & MACB_BIT(TXUBR));
++			gs->irq_rxubr += !!(status & MACB_BIT(RXUBR));
++			gs->irq_rovr += !!(status & MACB_BIT(ISR_ROVR));
++			gs->irq_txerr += !!(status & MACB_TX_ERR_FLAGS);
++			if (status & MACB_BIT(ISR_ROVR))
++				gem_rx_overrun_snapshot(queue, status, rx_status,
++							false);
++		}
+ 		if (status & MACB_BIT(WOL)) {
+ 			if (bp->caps & MACB_CAPS_ISR_CLEAR_ON_WRITE)
+ 				queue_writel(queue, ISR, MACB_BIT(WOL));
+@@ -1927,6 +2265,9 @@ static irqreturn_t macb_interrupt(int irq, void *dev_id)
+ 				queue_writel(queue, ISR, MACB_BIT(HRESP));
+ 		}
+ 		status = queue_readl(queue, ISR);
++		if (unlikely(status & MACB_BIT(ISR_ROVR)) && bp->gemslot &&
++		    !bp->gemslot->rx_overrun_seen)
++			rx_status = macb_readl(bp, RSR);
+ 	}
+ 
+ 	spin_unlock(&bp->lock);
+@@ -1998,6 +2339,7 @@ static unsigned int macb_tx_map(struct macb *bp,
+ 		tx_skb->mapping = mapping;
+ 		tx_skb->size = size;
+ 		tx_skb->mapped_as_page = false;
++		tx_skb->slot = false;
+ 
+ 		len -= size;
+ 		offset += size;
+@@ -2028,6 +2370,7 @@ static unsigned int macb_tx_map(struct macb *bp,
+ 			tx_skb->mapping = mapping;
+ 			tx_skb->size = size;
+ 			tx_skb->mapped_as_page = true;
++			tx_skb->slot = false;
+ 
+ 			len -= size;
+ 			offset += size;
+@@ -2362,6 +2705,16 @@ static void gem_free_rx_buffers(struct macb *bp)
+ 	int i;
+ 
+ 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
++		if (queue->rx_slot) {
++			for (i = 0; i < bp->rx_ring_size; i++) {
++				if (queue->rx_slot[i] != GEMSLOT_NO_SLOT)
++					macb_gemslot_put_slot(bp->gemslot,
++							      queue->rx_slot[i]);
++			}
++			kfree(queue->rx_slot);
++			queue->rx_slot = NULL;
++			continue;
++		}
+ 		if (!queue->rx_skbuff)
+ 			continue;
+ 
+@@ -2435,7 +2788,27 @@ static int gem_alloc_rx_buffers(struct macb *bp)
+ 	unsigned int q;
+ 	int size;
+ 
++	if (bp->gemslot && bp->gemslot->slot_count <
++	    bp->rx_ring_size * bp->num_queues + GEMSLOT_BATCH_MAX) {
++		netdev_err(bp->dev,
++			   "gemslot: %u receive slots cannot cover %u GEM descriptors and %u replacements\n",
++			   bp->gemslot->slot_count,
++			   bp->rx_ring_size * bp->num_queues,
++			   GEMSLOT_BATCH_MAX);
++		return -EINVAL;
++	}
++
+ 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
++		if (bp->gemslot) {
++			queue->rx_slot = kmalloc_array(bp->rx_ring_size,
++						      sizeof(*queue->rx_slot),
++						      GFP_KERNEL);
++			if (!queue->rx_slot)
++				return -ENOMEM;
++			memset16(queue->rx_slot, GEMSLOT_NO_SLOT,
++				 bp->rx_ring_size);
++			continue;
++		}
+ 		size = bp->rx_ring_size * sizeof(struct sk_buff *);
+ 		queue->rx_skbuff = kzalloc(size, GFP_KERNEL);
+ 		if (!queue->rx_skbuff)
+@@ -2484,7 +2857,7 @@ static int macb_alloc_consistent(struct macb *bp)
+ 			   queue->tx_ring);
+ 
+ 		size = bp->tx_ring_size * sizeof(struct macb_tx_skb);
+-		queue->tx_skb = kmalloc(size, GFP_KERNEL);
++		queue->tx_skb = kzalloc(size, GFP_KERNEL);
+ 		if (!queue->tx_skb)
+ 			goto out_err;
+ 
+@@ -2733,7 +3106,8 @@ static void macb_init_hw(struct macb *bp)
+ 	macb_set_hwaddr(bp);
+ 
+ 	config = macb_mdc_clk_div(bp);
+-	config |= MACB_BF(RBOF, NET_IP_ALIGN);	/* Make eth data aligned */
++	/* Make eth data aligned */
++	config |= MACB_BF(RBOF, NET_IP_ALIGN);
+ 
+ 	/* Do not discard Rx FCS if RX checsum offload disabled */
+ 	if (bp->dev->features & NETIF_F_RXCSUM)
+@@ -2953,6 +3327,7 @@ static int macb_close(struct net_device *dev)
+ 	unsigned int q;
+ 
+ 	netif_tx_stop_all_queues(dev);
++	macb_gemslot_link_down(bp->gemslot);
+ 
+ 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue)
+ 		napi_disable(&queue->napi);
+@@ -2964,6 +3339,7 @@ static int macb_close(struct net_device *dev)
+ 
+ 	spin_lock_irqsave(&bp->lock, flags);
+ 	macb_reset_hw(bp);
++	macb_gemslot_cancel_tx(bp);
+ 	netif_carrier_off(dev);
+ 	spin_unlock_irqrestore(&bp->lock, flags);
+ 
+@@ -5018,9 +5394,25 @@ static int macb_probe(struct platform_device *pdev)
+ 		goto err_out_free_netdev;
+ 	}
+ 
++	/* A memory-region on the node turns on the slot fast path. */
++	err = macb_gemslot_probe(bp);
++	if (err)
++		goto err_out_free_netdev;
++
++	/* The Zynq GEM config caps the MTU at ETH_DATA_LEN. The slot path
++	 * raises it, and the jumbo module parameter takes it back down to a
++	 * standard frame if jumbo receive turns out not to work on this part.
++	 */
++	if (bp->gemslot && macb_gemslot_jumbo) {
++		bp->caps |= MACB_CAPS_JUMBO;
++		bp->jumbo_max_len = GEMSLOT_JUMBO_FRAME_LEN;
++	}
++
+ 	/* MTU range: 68 - 1500 or 10240 */
+ 	dev->min_mtu = GEM_MTU_MIN_SIZE;
+-	if (bp->caps & MACB_CAPS_JUMBO)
++	if (bp->gemslot && macb_gemslot_jumbo)
++		dev->max_mtu = GEMSLOT_JUMBO_MTU;
++	else if (bp->caps & MACB_CAPS_JUMBO)
+ 		dev->max_mtu = gem_readl(bp, JML) - ETH_HLEN - ETH_FCS_LEN;
+ 	else
+ 		dev->max_mtu = ETH_DATA_LEN;
+@@ -5089,6 +5481,7 @@ err_out_phy_exit:
+ 	unregister_netdev(dev);
+ 
+ err_out_free_netdev:
++	macb_gemslot_remove(bp);
+ 	free_netdev(dev);
+ 
+ err_disable_clocks:
+@@ -5114,6 +5507,7 @@ static int macb_remove(struct platform_device *pdev)
+ 		mdiobus_free(bp->mii_bus);
+ 
+ 		unregister_netdev(dev);
++		macb_gemslot_remove(bp);
+ 		tasklet_kill(&bp->hresp_err_tasklet);
+ 		pm_runtime_disable(&pdev->dev);
+ 		pm_runtime_dont_use_autosuspend(&pdev->dev);
+@@ -5316,6 +5710,12 @@ static struct platform_driver macb_driver = {
+ 		.name		= "macb",
+ 		.of_match_table	= of_match_ptr(macb_dt_ids),
+ 		.pm	= &macb_pm_ops,
++		/* /dev/gemslot0 and the slot pool live as long as the driver
++		 * does, so an unbind would strand any descriptor user space
++		 * still holds. The driver is built in and this removes the
++		 * only path that could run macb_remove.
++		 */
++		.suppress_bind_attrs = true,
+ 	},
+ };
+ 
+diff --git a/include/uapi/linux/gemslot.h b/include/uapi/linux/gemslot.h
+new file mode 100644
+index 000000000..04c045944
+--- /dev/null
++++ b/include/uapi/linux/gemslot.h
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * GEM slot fast path, user-space ABI.
++ *
++ * /dev/gemslot0 is tied to GEM0. The reserved-memory pool behind it holds two
++ * rings of slot_count slots of slot_size bytes, the transmit ring first. Slot i
++ * of a ring starts at pool_phys + ring_offset + i * slot_size, and the frame
++ * inside a slot starts at byte offset 2 so the IP header and the payload behind
++ * it are 4-byte aligned.
++ */
++#ifndef _UAPI_LINUX_GEMSLOT_H
++#define _UAPI_LINUX_GEMSLOT_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++/* Frame offset inside a slot, and the GEM receive buffer offset. */
++#define GEMSLOT_FRAME_OFFSET	2
++
++/* Entries carried by one TX_SUBMIT, TX_COMPLETIONS, RX_POLL or RX_RETURN. */
++#define GEMSLOT_BATCH_MAX	64
++
++struct gemslot_info {
++	__u32 pool_phys;	/* physical base of the pool */
++	__u32 pool_size;
++	__u32 slot_size;
++	__u32 slot_count;	/* per ring */
++	__u32 tx_offset;	/* ring offsets from pool_phys */
++	__u32 rx_offset;
++};
++
++/* len is the frame length in bytes excluding the FCS. */
++struct gemslot_tx_entry {
++	__u16 slot;
++	__u16 len;
++};
++
++struct gemslot_tx_batch {
++	__u32 count;
++	struct gemslot_tx_entry entries[GEMSLOT_BATCH_MAX];
++};
++
++struct gemslot_rx_entry {
++	__u16 slot;
++	__u16 len;
++};
++
++struct gemslot_rx_batch {
++	__u32 count;
++	struct gemslot_rx_entry entries[GEMSLOT_BATCH_MAX];
++};
++
++struct gemslot_steer {
++	__u16 udp_port;
++	__u16 enable;
++};
++
++#define GEMSLOT_EVENT_TX	0x00000001u
++#define GEMSLOT_EVENT_RX	0x00000002u
++
++struct gemslot_wait {
++	__u32 events;		/* GEMSLOT_EVENT_* to wait on */
++	__u32 timeout_ms;	/* 0 polls without blocking */
++	__u32 tx_threshold;
++	__u32 rx_threshold;
++	__u32 tx_pending;	/* filled on return */
++	__u32 rx_pending;	/* filled on return */
++};
++
++#define GEMSLOT_STREAM_RX 0u
++#define GEMSLOT_STREAM_TX 1u
++
++/* CSR register offsets are relative to the bitstream's CSR window. */
++struct gemslot_stream_config {
++	__u32 direction;
++	__u32 instance;
++	__u32 ctrl;
++	__u32 produced;
++	__u32 observed;
++	__u32 released;
++	__u32 irq_threshold;
++	__u32 submit;
++	__u32 consumed;
++	__u32 consumed_count;
++	__u32 tx_irq_threshold;
++	__u32 slot_first;
++	__u32 slot_count;
++	__u32 frame_len;
++	__u32 udp_port;
++	__u32 format;
++};
++
++struct gemslot_stream_status {
++	__u32 direction;
++	__u32 active;
++	__u64 produced;
++	__u64 submitted;
++	__u64 completed;
++	__u64 consumed_ticks;
++	__u64 dropped;
++};
++
++#define GEMSLOT_IOC_MAGIC	'G'
++
++#define GEMSLOT_GET_INFO	_IOR(GEMSLOT_IOC_MAGIC, 0, struct gemslot_info)
++/* Returns the number of entries accepted, which may be fewer than count. */
++#define GEMSLOT_TX_SUBMIT	_IOW(GEMSLOT_IOC_MAGIC, 1, struct gemslot_tx_batch)
++#define GEMSLOT_TX_COMPLETIONS	_IOR(GEMSLOT_IOC_MAGIC, 2, struct gemslot_tx_batch)
++#define GEMSLOT_RX_STEER	_IOW(GEMSLOT_IOC_MAGIC, 3, struct gemslot_steer)
++#define GEMSLOT_RX_POLL		_IOR(GEMSLOT_IOC_MAGIC, 4, struct gemslot_rx_batch)
++#define GEMSLOT_RX_RETURN	_IOW(GEMSLOT_IOC_MAGIC, 5, struct gemslot_rx_batch)
++#define GEMSLOT_WAIT		_IOWR(GEMSLOT_IOC_MAGIC, 6, struct gemslot_wait)
++#define GEMSLOT_STREAM_START	_IOW(GEMSLOT_IOC_MAGIC, 7, struct gemslot_stream_config)
++#define GEMSLOT_STREAM_STOP	_IOW(GEMSLOT_IOC_MAGIC, 8, __u32)
++#define GEMSLOT_STREAM_STATUS	_IOWR(GEMSLOT_IOC_MAGIC, 9, struct gemslot_stream_status)
++#define GEMSLOT_CAP_KERNEL_PUMP	0x00000001u
++#define GEMSLOT_GET_CAPS	_IOR(GEMSLOT_IOC_MAGIC, 10, __u32)
++
++#endif /* _UAPI_LINUX_GEMSLOT_H */

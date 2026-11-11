@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Generate the shared wire-format test vectors under tools/vectors/.
+
+The vectors pin docs/wire-formats.md so the gateware, daemon, Soapy module and
+Python tools can all check themselves against one file. Regenerate with:
+
+    python3 tools/gen_vectors.py
+
+and commit the result. Every value is derived from vita.py, so a change here
+means a deliberate change to the wire format.
+"""
+
+import json
+import os
+import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import vita
+
+VECTOR_SEED = 0x504C5554
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors")
+
+EDGE_SAMPLES = [
+    [0, 0],
+    [1, -1],
+    [-1, 1],
+    [vita.SAMPLE_MAX, vita.SAMPLE_MIN],
+    [vita.SAMPLE_MIN, vita.SAMPLE_MAX],
+    [1234, -567],
+    [-2048, 0],
+    [2047, 2047],
+]
+
+
+def block(values):
+    """Pad or trim a sample list to exactly one block floating point block."""
+    out = list(values)
+    while len(out) < vita.BFP8_BLOCK_SAMPLES:
+        out.append([0, 0])
+    return out[:vita.BFP8_BLOCK_SAMPLES]
+
+
+def codec_case(name, fmt, samples):
+    payload = vita.pack(fmt, samples)
+    return {
+        "name": name,
+        "format": fmt,
+        "samples": [list(s) for s in samples],
+        "payload_hex": payload.hex(),
+        "decoded": [list(s) for s in vita.unpack(fmt, payload, len(samples))],
+    }
+
+
+def bfp_case(name, samples):
+    samples = block(samples)
+    payload = vita.pack_bfp8(samples)
+    peak = max(max(abs(i), abs(q)) for i, q in samples)
+    return {
+        "name": name,
+        "samples": [list(s) for s in samples],
+        "peak_magnitude": peak,
+        "exponent": vita.bfp8_exponent(peak),
+        "mantissas": [vita._sign_extend(b, vita.MANTISSA_BITS) for b in payload[:32]],
+        "payload_hex": payload.hex(),
+        "decoded": [list(s) for s in vita.unpack_bfp8(payload, len(samples))],
+    }
+
+
+def packet_case(name, fmt, stream_id, count, ticks, samples, end_of_burst, channels):
+    payload = vita.pack(fmt, samples)
+    packet = vita.build_packet(
+        stream_id, vita.PACKET_CLASS_BY_FORMAT[fmt], count, ticks, payload,
+        end_of_burst=end_of_burst)
+    return {
+        "name": name,
+        "format": fmt,
+        "channels": channels,
+        "stream_id": stream_id,
+        "packet_count": count,
+        "ticks": ticks,
+        "end_of_burst": end_of_burst,
+        "samples": [list(s) for s in samples],
+        "packet_hex": packet.hex(),
+    }
+
+
+def main():
+    rng = random.Random(VECTOR_SEED)
+
+    sizing = []
+    for mtu in (1500, 9000):
+        for fmt in vita.FORMATS:
+            count = vita.samples_per_packet(fmt, mtu)
+            sizing.append({
+                "format": fmt,
+                "mtu": mtu,
+                "samples": count,
+                "payload_bytes": vita.payload_bytes_for(fmt, count),
+                "packet_words": vita.packet_words(fmt, count),
+                "packet_bytes": vita.packet_words(fmt, count) * vita.WORD_BYTES,
+            })
+
+    random_samples = [[rng.randint(vita.SAMPLE_MIN, vita.SAMPLE_MAX),
+                       rng.randint(vita.SAMPLE_MIN, vita.SAMPLE_MAX)] for _ in range(48)]
+
+    codec = [
+        codec_case("cs12_edges", "cs12", EDGE_SAMPLES),
+        codec_case("cs12_random", "cs12", random_samples),
+        codec_case("cs8_edges", "cs8", EDGE_SAMPLES),
+        codec_case("cs8_random", "cs8", random_samples),
+        codec_case("bfp8_random", "bfp8", random_samples),
+    ]
+
+    blocks = [
+        bfp_case("all_zero", [[0, 0]] * 16),
+        bfp_case("peak_127_exponent_0", [[127, -127], [3, -3], [1, 0]]),
+        bfp_case("peak_128_exponent_1", [[128, -128], [3, -3], [1, -1], [5, 2]]),
+        bfp_case("peak_255_exponent_1", [[255, -255], [7, -7]]),
+        bfp_case("peak_256_exponent_2", [[256, -256], [6, -6], [2, -2]]),
+        bfp_case("peak_1023_exponent_3", [[1023, -1023], [4, -4]]),
+        bfp_case("peak_2047_clamps", [[vita.SAMPLE_MAX, -vita.SAMPLE_MAX], [16, -16]]),
+        bfp_case("peak_2048_exponent_5", [[vita.SAMPLE_MIN, vita.SAMPLE_MAX], [32, -32]]),
+        bfp_case("random_block", random_samples[:16]),
+    ]
+
+    two_channel = []
+    for n in range(8):
+        two_channel.append([100 + n, -(100 + n)])
+        two_channel.append([-(900 + n), 900 + n])
+
+    packets = [
+        packet_case("cs12_short_burst", "cs12", 0x0000A001, 3, 0x0000000123456789,
+                    EDGE_SAMPLES, False, 1),
+        packet_case("cs8_end_of_burst", "cs8", 0x0000A002, 15, 0x7FFFFFFF00000001,
+                    EDGE_SAMPLES, True, 1),
+        packet_case("bfp8_two_blocks", "bfp8", 0x0000A003, 0, 0,
+                    random_samples[:32], False, 1),
+        packet_case("cs12_two_channel_interleave", "cs12", 0x0000A004, 7, 61440000,
+                    two_channel, False, 2),
+    ]
+
+    doc = {
+        "note": "Shared wire-format vectors for plutosky-stream, generated by "
+                "tools/gen_vectors.py from tools/vita.py. Sample components are "
+                "signed 12-bit values.",
+        "sample_bits": vita.SAMPLE_BITS,
+        "sample_min": vita.SAMPLE_MIN,
+        "sample_max": vita.SAMPLE_MAX,
+        "samples_per_packet": sizing,
+        "codec": codec,
+        "bfp8_blocks": blocks,
+        "packets": packets,
+    }
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    path = os.path.join(OUT_DIR, "wire_formats.json")
+    with open(path, "w") as handle:
+        json.dump(doc, handle, indent=1, sort_keys=False)
+        handle.write("\n")
+    print("wrote", path)
+
+
+if __name__ == "__main__":
+    main()

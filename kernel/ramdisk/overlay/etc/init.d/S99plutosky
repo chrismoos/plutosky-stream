@@ -1,0 +1,79 @@
+#!/bin/sh
+#
+# plutosky-stream: bring the data Ethernet port up and start the daemon.
+#
+
+PREFIX=/opt/plutosky
+DAEMON=$PREFIX/daemon
+CONFIG=$PREFIX/config
+PIDFILE=/var/run/plutosky.pid
+
+[ -r $CONFIG ] && . $CONFIG
+
+# The vendor network script derives eth0 from the same u-boot variables, and
+# falls back to DHCP when ipaddr_eth is unset.
+ETH_IPADDR=${ETH_IPADDR:-`fw_printenv -n ipaddr_eth 2> /dev/null`}
+ETH_NETMASK=${ETH_NETMASK:-`fw_printenv -n netmask_eth 2> /dev/null || echo 255.255.255.0`}
+ETH_MTU=${ETH_MTU:-1500}
+
+eth_up() {
+	# The GEM driver refuses an MTU change while the port is running.
+	ifconfig eth0 mtu $ETH_MTU 2> /dev/null ||
+		echo "eth0 rejected mtu $ETH_MTU, leaving it alone"
+	ifconfig eth0 up 2> /dev/null || return 1
+
+	if [ -n "$ETH_IPADDR" ]; then
+		ifconfig eth0 $ETH_IPADDR netmask $ETH_NETMASK
+	elif ! ifconfig eth0 | grep -q "inet addr"; then
+		udhcpc -i eth0 -b -t 3 -q 2>&1 | logger
+	fi
+}
+
+# Kernel threads have no command line, so the thread is found by its name.
+pump_priority() {
+	[ -n "$PUMP_PRIORITY" ] || return 0
+	for comm in /proc/[0-9]*/comm; do
+		[ "`cat $comm 2> /dev/null`" = gemslot-pump ] || continue
+		pid=${comm#/proc/}
+		chrt -f -p $PUMP_PRIORITY ${pid%/comm} > /dev/null ||
+			echo "gemslot-pump rejected priority $PUMP_PRIORITY"
+		return 0
+	done
+	echo "no gemslot-pump thread, its priority is unchanged"
+}
+
+case "$1" in
+  start)
+	printf "Starting plutosky-stream: "
+	eth_up
+	pump_priority
+
+	if [ ! -c /dev/gemslot0 ]; then
+		echo "FAIL (no /dev/gemslot0, the slot fast path is not in this kernel)"
+		exit 0
+	fi
+
+	if [ ! -x $DAEMON ]; then
+		echo "OK (no daemon installed)"
+		exit 0
+	fi
+
+	start-stop-daemon -S -b -q -m -p $PIDFILE -x $DAEMON -- $DAEMON_OPTS
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+	;;
+  stop)
+	printf "Stopping plutosky-stream: "
+	start-stop-daemon -K -q -p $PIDFILE 2> /dev/null
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+	;;
+  restart|reload)
+	"$0" stop
+	sleep 1
+	"$0" start
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

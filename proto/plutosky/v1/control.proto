@@ -1,0 +1,300 @@
+syntax = "proto3";
+
+package plutosky.v1;
+
+// Board control for plutosky-stream. Sample data does not use this service. It
+// moves as VITA 49.2 packets over UDP, as docs/wire-formats.md describes.
+//
+// Read-only calls need no session. Calls that change the radio or a stream
+// must send the `plutosky-session` metadata key set to the id of an open
+// Session.
+service Control {
+  // Board identity and capabilities.
+  rpc GetInfo(GetInfoRequest) returns (BoardInfo);
+
+  // Holds radio control for as long as the call stays open. The client's first
+  // message must be SessionStart. The daemon answers with SessionOpened, then
+  // sends one StatusTick per interval while the session has open streams.
+  // Ending the call closes the session's streams and turns TX off.
+  rpc Session(stream SessionCommand) returns (stream SessionEvent);
+
+  rpc SetFrequency(SetFrequencyRequest) returns (FrequencyReply);
+  rpc GetFrequency(ChannelRef) returns (FrequencyReply);
+  rpc SetSampleRate(SetSampleRateRequest) returns (SampleRateReply);
+  rpc GetSampleRate(Empty) returns (SampleRateReply);
+  rpc SetBandwidth(SetBandwidthRequest) returns (BandwidthReply);
+  rpc GetBandwidth(ChannelRef) returns (BandwidthReply);
+  rpc SetGain(SetGainRequest) returns (GainReply);
+  rpc GetGain(ChannelRef) returns (GainReply);
+  rpc SetGainMode(SetGainModeRequest) returns (GainModeReply);
+  rpc ListAntennas(ListAntennasRequest) returns (AntennaList);
+  rpc SetAntenna(SetAntennaRequest) returns (AntennaReply);
+  rpc SetLoopback(SetLoopbackRequest) returns (LoopbackReply);
+  rpc GetHardwareTime(Empty) returns (HardwareTime);
+  rpc SetHardwareTime(HardwareTime) returns (HardwareTime);
+  rpc GetSensors(Empty) returns (Sensors);
+
+  rpc OpenStream(OpenStreamRequest) returns (OpenStreamReply);
+  rpc StartStream(StartStreamRequest) returns (Empty);
+  rpc StopStream(StreamRef) returns (Empty);
+  rpc CloseStream(StreamRef) returns (Empty);
+}
+
+message Empty {}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_RX = 1;
+  DIRECTION_TX = 2;
+}
+
+enum SampleFormat {
+  SAMPLE_FORMAT_UNSPECIFIED = 0;
+  SAMPLE_FORMAT_CS12 = 1;
+  SAMPLE_FORMAT_CS8 = 2;
+  SAMPLE_FORMAT_BFP8 = 3;
+}
+
+enum GainMode {
+  GAIN_MODE_UNSPECIFIED = 0;
+  GAIN_MODE_MANUAL = 1;
+  GAIN_MODE_SLOW_ATTACK = 2;
+  GAIN_MODE_FAST_ATTACK = 3;
+}
+
+message GetInfoRequest {
+  // Client name for the daemon's log.
+  string client = 1;
+}
+
+message BoardInfo {
+  string serial = 1;
+  string version = 2;
+  // RF channels in the loaded bitstream, 1 or 2.
+  uint32 channels = 3;
+  uint32 min_rate_hz = 4;
+  uint32 max_rate_hz = 5;
+  repeated SampleFormat formats = 6;
+  repeated uint32 mtus = 7;
+}
+
+message SessionCommand {
+  oneof command {
+    SessionStart start = 1;
+    SetStatusInterval set_status_interval = 2;
+  }
+}
+
+message SessionStart {
+  // Client name for the daemon's log.
+  string client = 1;
+}
+
+// 1 to 1000 ms. A new session starts at 10 ms.
+message SetStatusInterval {
+  uint32 interval_ms = 1;
+}
+
+message SessionEvent {
+  oneof event {
+    SessionOpened opened = 1;
+    StatusTick status = 2;
+  }
+}
+
+message SessionOpened {
+  string session_id = 1;
+  uint32 status_interval_ms = 2;
+}
+
+// The counters of every open stream in the session, read together.
+message StatusTick {
+  // Timebase count when the counters were read.
+  uint64 ticks = 1;
+  repeated StreamStatus streams = 2;
+}
+
+// Counters accumulate from StartStream.
+message StreamStatus {
+  uint32 stream_id = 1;
+  // RX: packets written by the packetizer. TX: packets handed to the
+  // depacketizer.
+  uint64 produced = 2;
+  // RX: packets sent by the Ethernet controller. TX: sample count following
+  // the last sample played.
+  uint64 consumed = 3;
+  // TX: packets dropped because their timestamp had passed.
+  uint64 late = 4;
+  // TX: sample periods an open burst had no sample for.
+  uint64 underrun = 5;
+  // RX: samples dropped for want of a free slot.
+  uint64 overflow = 6;
+  // TX: breaks in the packet count.
+  uint64 gaps = 7;
+  // Set once, when the stream stops on its own.
+  string error = 8;
+}
+
+message ChannelRef {
+  Direction dir = 1;
+  uint32 chan = 2;
+}
+
+// One synthesizer serves each direction, so a frequency change retunes both
+// channels of that direction.
+message SetFrequencyRequest {
+  Direction dir = 1;
+  uint32 chan = 2;
+  uint64 hz = 3;
+}
+
+message FrequencyReply {
+  uint64 hz = 1;
+}
+
+// Sets the rate of one direction, or of both when dir is unspecified, for
+// both channels. Reruns the LVDS calibration, which takes a few seconds, so the
+// call deadline must be at least 10 s.
+//
+// The radio runs at the slowest rate that is a whole multiple of both
+// directions' rates. The other direction keeps a rate this session set when
+// such a radio rate exists. Otherwise it takes the new rate as well, and its
+// streams are refused until its rate is set again.
+message SetSampleRateRequest {
+  uint32 hz = 1;
+  Direction dir = 2;
+}
+
+message SampleRateReply {
+  // The rate of the direction that was set. The receive rate for
+  // GetSampleRate and for a request that set both.
+  uint32 hz = 1;
+  uint32 rx_hz = 2;
+  uint32 tx_hz = 3;
+  // Timebase counts per second.
+  uint32 tick_rate_hz = 4;
+  // Timebase counts one sample of each direction spans.
+  uint32 rx_ticks_per_sample = 5;
+  uint32 tx_ticks_per_sample = 6;
+  // Timebase counts the rate filter delays each direction by, 0 when that
+  // direction runs at the radio rate. A receive sample was at the radio
+  // rx_delay_ticks before its timestamp. A transmit sample reaches the radio
+  // tx_delay_ticks after its timestamp.
+  uint32 rx_delay_ticks = 7;
+  uint32 tx_delay_ticks = 8;
+}
+
+message SetBandwidthRequest {
+  Direction dir = 1;
+  uint32 chan = 2;
+  uint32 hz = 3;
+}
+
+message BandwidthReply {
+  uint32 hz = 1;
+}
+
+// Receive gain is in whole dB. TX gain runs from 0 dB at maximum attenuation to
+// 89.75 dB at zero attenuation, in 0.25 dB steps.
+message SetGainRequest {
+  Direction dir = 1;
+  uint32 chan = 2;
+  double db = 3;
+}
+
+message GainReply {
+  double db = 1;
+}
+
+// Receive only.
+message SetGainModeRequest {
+  Direction dir = 1;
+  uint32 chan = 2;
+  GainMode mode = 3;
+}
+
+message GainModeReply {
+  GainMode mode = 1;
+}
+
+message ListAntennasRequest {
+  Direction dir = 1;
+}
+
+message AntennaList {
+  repeated string names = 1;
+}
+
+message SetAntennaRequest {
+  Direction dir = 1;
+  uint32 chan = 2;
+  string name = 3;
+}
+
+message AntennaReply {
+  string name = 1;
+}
+
+// The AD9363's digital TX-to-RX loopback. A sample rate change turns it off.
+message SetLoopbackRequest {
+  bool on = 1;
+}
+
+message LoopbackReply {
+  bool on = 1;
+}
+
+// The 64-bit timebase. It counts at SampleRateReply.tick_rate_hz.
+message HardwareTime {
+  uint64 ticks = 1;
+}
+
+message Sensors {
+  double temperature_c = 1;
+  // Per receive channel.
+  repeated double rssi_dbfs = 2;
+  bool rx_lo_locked = 3;
+  bool tx_lo_locked = 4;
+  bool tx_rf_enabled = 5;
+}
+
+message OpenStreamRequest {
+  Direction dir = 1;
+  repeated uint32 chans = 2;
+  SampleFormat format = 3;
+  uint32 mtu = 4;
+  // The host data socket. StartStream replaces both with the source of the
+  // host's empty VITA packet.
+  string host_ip = 5;
+  uint32 host_port = 6;
+}
+
+message OpenStreamReply {
+  uint32 stream_id = 1;
+  // The board's UDP port for the stream's data.
+  uint32 data_port = 2;
+  // Samples across all of the stream's channels.
+  uint32 samples_per_packet = 3;
+  // Packets the host keeps outstanding.
+  uint32 window = 4;
+}
+
+message StartStreamRequest {
+  uint32 stream_id = 1;
+  // RX only: start at this timebase count. Unset starts at once.
+  optional uint64 at_ticks = 2;
+}
+
+message StreamRef {
+  uint32 stream_id = 1;
+}
+
+// The UDP discovery reply. A datagram with the payload `plutosky-stream?` to
+// port 30001, broadcast or sent to the board, is answered with one of these.
+message DiscoveryReply {
+  string name = 1;
+  string serial = 2;
+  string version = 3;
+  uint32 control_port = 4;
+  string mac = 5;
+}

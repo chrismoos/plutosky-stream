@@ -1,0 +1,8 @@
+// SD card boot image: the FSBL programs the PL from the bitstream inside
+// BOOT.bin at power-on, then hands over to u-boot. The layout matches the
+// vendor image with this bitstream in place of theirs.
+img : {
+	[bootloader] fsbl.elf
+	plutosky_stream.bit
+	u-boot.elf
+}

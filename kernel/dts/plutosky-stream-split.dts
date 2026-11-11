@@ -1,0 +1,17 @@
+/*
+ * PlutoSky 7020 device tree for plutosky-stream, split-clock bitstream.
+ *
+ * The split-clock bitstream runs its control plane on FCLK0 at 50 MHz and its
+ * streaming datapath on FCLK1 at 100 MHz. The vendor FSBL leaves FCLK0 at
+ * 100 MHz and FCLK1 at 200 MHz, so this variant
+ * asks the PS7 clock controller for both rates as it registers itself, which
+ * is before any driver probes.
+ *
+ * Build with: dtc -I dts -O dtb -o devicetree-split.dtb plutosky-stream-split.dts
+ */
+/include/ "plutosky-stream.dts"
+
+&clkc {
+	assigned-clocks = <&clkc 0x0f>, <&clkc 0x10>;
+	assigned-clock-rates = <50000000>, <100000000>;
+};

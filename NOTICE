@@ -1,0 +1,34 @@
+plutosky-stream is licensed under Apache-2.0 (LICENSE) with these exceptions.
+
+kernel/patches
+  Linux kernel patches, licensed under GPL-2.0-only (kernel/COPYING).
+
+daemon/vendor/ad9361-noos
+  Analog Devices no-OS AD9361 driver, from the copy LiteX-M2SDR includes,
+  with local modifications described in its README, under the license in each
+  file header.
+
+gateware/soc/cores/ad9361
+  PHY, SPI and PRBS cores derived from LiteX-M2SDR, with local modifications,
+  licensed under BSD-2-Clause (gateware/soc/cores/ad9361/LICENSE).
+
+gateware/build_artifacts/vivado-2r2t/BOOT.bin
+  Besides the plutosky-stream bitstream, the SD boot image contains the Zynq
+  first-stage boot loader and the U-Boot boot loader extracted unmodified from
+  the board vendor's stock SD card image. The first-stage boot loader is
+  Xilinx-generated code under Xilinx's license terms. U-Boot is licensed
+  under GPL-2.0.
+
+kernel/out/zImage
+  The Linux kernel built from the pinned kernel source with kernel/patches
+  applied, licensed under GPL-2.0-only (kernel/COPYING).
+
+kernel/out/rootfs.cpio.gz
+  The PlutoSDR root file system from the board vendor's stock SD card image,
+  repacked with the plutosky-stream daemon, its register map and init script.
+  The programs and libraries it contains remain under their own licenses,
+  including GPL-2.0 for BusyBox.
+
+sdcard/
+  The same boot image, kernel and root file system as above, wrapped in u-boot
+  image headers for the SD card, under the same licenses.
