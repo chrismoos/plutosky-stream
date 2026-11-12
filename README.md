@@ -85,6 +85,14 @@ reverse path and go out when the board's sample clock reaches their timestamp.
 Device arguments, stream arguments and sample formats are in
 [docs/soapy-usage.md](docs/soapy-usage.md).
 
+## Tested applications
+
+| Application | Configuration |
+|---|---|
+| [1xBTS](https://github.com/chrismoos/1xbts) | [`config/radio_plutosky.json`](https://github.com/chrismoos/1xbts/blob/main/config/radio_plutosky.json) |
+| [136BTS](https://github.com/chrismoos/136-bts) | [`config/plutosky.yaml`](https://github.com/chrismoos/136-bts/blob/main/config/plutosky.yaml) |
+| [Osmocom](https://osmocom.org/projects/osmotrx) `osmo-trx-uhd` | `dev-args type=soapy,driver=plutosky,addr=192.168.1.10,hardware=B200,rx_time_offset_ns=22924` |
+
 ## Limits
 
 - **Full duplex:** sustained at 13 to 14 MS/s on one channel, or 6.5 to
