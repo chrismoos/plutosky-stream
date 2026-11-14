@@ -13,7 +13,7 @@ osmo-trx shifts receive by a fixed per-device delay. Running the board as
 hardware=B200 at 4 samples per symbol applies the B200's 61.846 us, so the
 offset to configure is the measured delay minus that.
 
-    rx_delay_measure.py --args driver=plutosky,addr=192.168.1.10
+    rx_delay_measure.py --args driver=plutosky,addr=192.168.200.10
 
 Run it with the rx_time_offset_ns you intend to replace, or none. The
 recommendation accounts for whichever is in --args.

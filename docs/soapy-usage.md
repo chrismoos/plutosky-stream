@@ -19,7 +19,7 @@ each run with a `RESULT` line:
 
 ```sh
 plutosky_probe --find
-plutosky_probe --probe  --args=driver=plutosky,addr=192.168.1.10
+plutosky_probe --probe  --args=driver=plutosky,addr=192.168.200.10
 plutosky_probe --duplex --args=driver=plutosky --rate=1000000 --secs=1
 ```
 

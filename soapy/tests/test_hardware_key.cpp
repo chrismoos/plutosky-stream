@@ -11,7 +11,7 @@ int main()
     CHECK_STR(hardwareKey({{"hardware", "B210"}}, ""), "B210");
     CHECK_STR(hardwareKey({{"hardware", ""}}, "000a35000122"), "000a35000122");
 
-    DeviceArgs found{{"driver", "plutosky"}, {"addr", "192.168.1.10"}};
+    DeviceArgs found{{"driver", "plutosky"}, {"addr", "192.168.200.10"}};
     keepHardwareArg(found, {{"driver", "plutosky"}});
     CHECK(found.count("hardware") == 0);
     keepHardwareArg(found, {{"driver", "plutosky"}, {"hardware", "B200"}});

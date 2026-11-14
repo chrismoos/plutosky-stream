@@ -1,7 +1,7 @@
 # plutosky-stream settings, read by /etc/init.d/S99plutosky.
 #
-# ETH_IPADDR   static address for eth0. Empty takes the u-boot ipaddr_eth
-#              variable, or DHCP when that is unset.
+# ETH_IPADDR   default static address for eth0. The u-boot variable ipaddr_eth
+#              overrides it, with netmask_eth. Empty in both selects DHCP.
 # ETH_NETMASK  netmask that goes with ETH_IPADDR.
 # ETH_MTU      MTU for eth0. 1500 by default. 9000 needs jumbo receive, which the
 #              board has not validated.
@@ -11,7 +11,7 @@
 #              normal priority, where it can wait behind other tasks and a
 #              transmit packet close to its timestamp is dropped as late.
 
-ETH_IPADDR=192.168.1.10
+ETH_IPADDR=192.168.200.10
 ETH_NETMASK=255.255.255.0
 ETH_MTU=1500
 DAEMON_OPTS="--csr-json /opt/plutosky/csr.json --uio /dev/uio0"

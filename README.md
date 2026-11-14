@@ -38,9 +38,9 @@ reverse path and go out when the board's sample clock reaches their timestamp.
    ```
 
    Boot the board with the DIP switch in SD mode. The daemon starts at boot,
-   and the Ethernet port comes up at 192.168.1.10/24. A directly connected host
-   needs an address on 192.168.1.0/24, such as 192.168.1.2. SSH logs in as
-   `root` with password `analog`.
+   and the Ethernet port comes up at 192.168.200.10/24. A directly connected
+   host needs an address on 192.168.200.0/24, such as 192.168.200.2. SSH logs
+   in as `root` with password `analog`.
 
 2. Build and install the SoapySDR module. The module must be installed into
    the prefix of the SoapySDR runtime that loads it.
@@ -72,8 +72,23 @@ reverse path and go out when the board's sample clock reaches their timestamp.
 
    ```sh
    SoapySDRUtil --find="driver=plutosky"
-   SoapySDRUtil --probe="driver=plutosky,addr=192.168.1.10"
+   SoapySDRUtil --probe="driver=plutosky,addr=192.168.200.10"
    ```
+
+## Board address
+
+The Ethernet port's address is 192.168.200.10/24.
+
+To change it, set the U-Boot variables `ipaddr_eth` and `netmask_eth` on the
+board over SSH, then power-cycle it:
+
+```sh
+fw_setenv ipaddr_eth 10.0.0.50
+fw_setenv netmask_eth 255.255.255.0
+```
+
+The stock PlutoSDR `config.txt` sets the same variables under
+`[USB_ETHERNET]`. `fw_setenv ipaddr_eth` with no value restores the default.
 
 ## Clients
 
@@ -91,7 +106,7 @@ Device arguments, stream arguments and sample formats are in
 |---|---|
 | [1xBTS](https://github.com/chrismoos/1xbts) | [`config/radio_plutosky.json`](https://github.com/chrismoos/1xbts/blob/main/config/radio_plutosky.json) |
 | [136BTS](https://github.com/chrismoos/136-bts) | [`config/plutosky.yaml`](https://github.com/chrismoos/136-bts/blob/main/config/plutosky.yaml) |
-| [Osmocom](https://osmocom.org/projects/osmotrx) `osmo-trx-uhd` | `dev-args type=soapy,driver=plutosky,addr=192.168.1.10,hardware=B200,rx_time_offset_ns=22924` |
+| [Osmocom](https://osmocom.org/projects/osmotrx) `osmo-trx-uhd` | `dev-args type=soapy,driver=plutosky,hardware=B200,rx_time_offset_ns=22924` |
 
 ## Limits
 

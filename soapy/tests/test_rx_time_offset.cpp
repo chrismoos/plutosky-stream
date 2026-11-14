@@ -42,7 +42,7 @@ int main()
         CHECK(rxClientTicks(rxBoardTicks(5000, offset), offset) == 5000);
     CHECK(rxBoardTicks(10, -40) == 0);
 
-    DeviceArgs found{{"driver", "plutosky"}, {"addr", "192.168.1.10"}};
+    DeviceArgs found{{"driver", "plutosky"}, {"addr", "192.168.200.10"}};
     keepRxTimeOffsetArg(found, {{"driver", "plutosky"}});
     CHECK(found.count("rx_time_offset_ns") == 0);
     keepRxTimeOffsetArg(found, {{"driver", "plutosky"}, {"rx_time_offset_ns", "-12000"}});

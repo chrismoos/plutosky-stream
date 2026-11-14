@@ -10,11 +10,22 @@ PIDFILE=/var/run/plutosky.pid
 
 [ -r $CONFIG ] && . $CONFIG
 
-# The vendor network script derives eth0 from the same u-boot variables, and
-# falls back to DHCP when ipaddr_eth is unset.
-ETH_IPADDR=${ETH_IPADDR:-`fw_printenv -n ipaddr_eth 2> /dev/null`}
-ETH_NETMASK=${ETH_NETMASK:-`fw_printenv -n netmask_eth 2> /dev/null || echo 255.255.255.0`}
+# The u-boot ipaddr_eth variable, which the stock config.txt sets, overrides
+# the configured default address.
+UBOOT_IPADDR=`fw_printenv -n ipaddr_eth 2> /dev/null`
+if [ -n "$UBOOT_IPADDR" ]; then
+	ETH_IPADDR=$UBOOT_IPADDR
+	ETH_NETMASK=`fw_printenv -n netmask_eth 2> /dev/null || echo $ETH_NETMASK`
+fi
+ETH_NETMASK=${ETH_NETMASK:-255.255.255.0}
 ETH_MTU=${ETH_MTU:-1500}
+
+# The vendor network script brings eth0 up with no broadcast address, and
+# ifconfig keeps it at 0.0.0.0 when given the same address again.
+broadcast_of() {
+	set -- `echo $1 $2 | tr . " "`
+	echo $(($1 | (255 - $5))).$(($2 | (255 - $6))).$(($3 | (255 - $7))).$(($4 | (255 - $8)))
+}
 
 eth_up() {
 	# The GEM driver refuses an MTU change while the port is running.
@@ -23,7 +34,8 @@ eth_up() {
 	ifconfig eth0 up 2> /dev/null || return 1
 
 	if [ -n "$ETH_IPADDR" ]; then
-		ifconfig eth0 $ETH_IPADDR netmask $ETH_NETMASK
+		ifconfig eth0 $ETH_IPADDR netmask $ETH_NETMASK \
+			broadcast `broadcast_of $ETH_IPADDR $ETH_NETMASK`
 	elif ! ifconfig eth0 | grep -q "inet addr"; then
 		udhcpc -i eth0 -b -t 3 -q 2>&1 | logger
 	fi
